@@ -11,7 +11,14 @@ import { stableId } from "../utils.js";
 import { findCommand } from "../platform.js";
 
 function memorixBinary(): string | null {
-  const local = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "node_modules", ".bin", "memorix");
+  const local = resolve(
+    dirname(fileURLToPath(import.meta.url)),
+    "..",
+    "..",
+    "node_modules",
+    ".bin",
+    process.platform === "win32" ? "memorix.cmd" : "memorix",
+  );
   if (existsSync(local)) return local;
   let directory = dirname(fileURLToPath(import.meta.url));
   for (let depth = 0; depth < 10; depth += 1) {
