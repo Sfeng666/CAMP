@@ -1,0 +1,10 @@
+export declare function sha256(value: string | Buffer): string;
+export declare function stableId(...parts: Array<string | number | null | undefined>): string;
+export declare function nowIso(): string;
+export declare function newId(): string;
+export declare function isInsidePath(candidate: string, root: string): boolean;
+export declare function atomicWrite(path: string, content: string | Buffer, mode?: number): void;
+export declare function readJsonFile<T>(path: string, fallback: T): T;
+export declare function fileFingerprint(path: string): string;
+export declare function toStringContent(value: unknown): string;
+export declare function truncateByApproxTokens(text: string, maxTokens: number): string;

@@ -1,0 +1,31 @@
+import type { AgentSource, AgentSurface, CanonicalMessage, CanonicalSession, ProjectRegistration } from "../types.js";
+export type ProjectMatch = "exact" | "parent" | "unrelated" | "unknown";
+export declare function walkFiles(root: string, extensions: string[], maxDepth?: number): Promise<string[]>;
+export declare function readJsonLines(path: string, handler: (value: Record<string, unknown>, line: number) => void): Promise<void>;
+export declare function projectMatch(cwd: string | null | undefined, project: ProjectRegistration): ProjectMatch;
+export declare function timestamp(value: unknown, fallback?: string): string;
+export declare function normalizeRole(value: unknown): CanonicalMessage["role"];
+export declare function message(sequence: number, input: {
+    id?: string;
+    role?: unknown;
+    kind?: CanonicalMessage["kind"];
+    content: unknown;
+    timestamp?: unknown;
+    toolName?: string;
+    parentId?: string;
+    metadata?: Record<string, unknown>;
+}): CanonicalMessage | null;
+export declare function dedupeMessages(messages: CanonicalMessage[]): CanonicalMessage[];
+export declare function canonicalSession(input: {
+    source: AgentSource;
+    surface?: AgentSurface;
+    sourceVersion?: string;
+    nativeId: string;
+    project: ProjectRegistration;
+    cwd: string | null;
+    sourcePath: string;
+    messages: CanonicalMessage[];
+    attachments?: CanonicalSession["attachments"];
+    metadata?: Record<string, unknown>;
+}): Promise<CanonicalSession>;
+export declare function readText(path: string): Promise<string>;
