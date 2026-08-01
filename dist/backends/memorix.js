@@ -11,6 +11,16 @@ function memorixBinary() {
     const local = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "node_modules", ".bin", "memorix");
     if (existsSync(local))
         return local;
+    let directory = dirname(fileURLToPath(import.meta.url));
+    for (let depth = 0; depth < 10; depth += 1) {
+        const bundled = join(directory, "node_modules", "memorix", "dist", "cli", "index.js");
+        if (existsSync(bundled))
+            return bundled;
+        const parent = dirname(directory);
+        if (parent === directory)
+            break;
+        directory = parent;
+    }
     // A packed scoped package lives below node_modules/@camp-memory/cli, so its
     // sibling node_modules directory is not two levels above this file. Resolve
     // the pinned dependency through Node instead of assuming an installation
@@ -44,10 +54,20 @@ function memorixEnvironment(dataDir) {
         MEMORIX_AUTO_UPDATE: "off",
     };
 }
+function processText(value) {
+    return typeof value === "string" ? value : value?.toString("utf8") ?? "";
+}
 function processError(result) {
-    const stderr = typeof result.stderr === "string" ? result.stderr : result.stderr?.toString("utf8") ?? "";
-    const stdout = typeof result.stdout === "string" ? result.stdout : result.stdout?.toString("utf8") ?? "";
+    const stderr = processText(result.stderr);
+    const stdout = processText(result.stdout);
     return stderr.trim() || stdout.trim() || `memorix exited ${result.status}`;
+}
+function runMemorix(binary, args, options) {
+    // npm's Windows shims are .cmd files. When dependency resolution returns
+    // Memorix's JavaScript entry point directly, launch it through the current
+    // Node executable instead of relying on Windows file association.
+    const script = binary.endsWith(".js");
+    return spawnSync(script ? process.execPath : binary, script ? [binary, ...args] : args, options);
 }
 export function matchMemorixObservations(records, observations) {
     const matched = [];
@@ -118,7 +138,7 @@ export function flushMemorix(store, project) {
         if (row.project_id !== project.id || row.action !== "remember")
             continue;
         const record = JSON.parse(String(row.payload_json));
-        const result = spawnSync(binary, [
+        const result = runMemorix(binary, [
             "remember",
             record.content,
             "--title",
@@ -210,7 +230,7 @@ export function archiveMemorixProjectRecords(store, project) {
             errors: ["Memorix database is missing; canonical CAMP data was not purged"],
         };
     }
-    const context = spawnSync(binary, ["memory", "recent", "--limit", "1", "--json", "--cwd", project.rootPath], {
+    const context = runMemorix(binary, ["memory", "recent", "--limit", "1", "--json", "--cwd", project.rootPath], {
         cwd: project.rootPath,
         env: memorixEnvironment(dataDir),
         encoding: "utf8",
@@ -227,7 +247,7 @@ export function archiveMemorixProjectRecords(store, project) {
     }
     let memorixProjectId = "";
     try {
-        const payload = JSON.parse(context.stdout);
+        const payload = JSON.parse(processText(context.stdout));
         if (typeof payload.project?.id === "string")
             memorixProjectId = payload.project.id;
     }
@@ -307,7 +327,7 @@ export function archiveMemorixProjectRecords(store, project) {
     }
     const pendingArchive = pairs.filter((pair) => pair.observation.status !== "archived");
     if (pendingArchive.length) {
-        const result = spawnSync(binary, [
+        const result = runMemorix(binary, [
             "memory",
             "resolve",
             "--ids",

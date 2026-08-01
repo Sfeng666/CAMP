@@ -139,20 +139,37 @@ function scanGlobalComposerHeaders(
 
   const roots = new Set([project.rootPath, ...project.activePaths].map(canonicalPath));
   const encodedRoot = encodeURI(project.rootPath);
-  const rows = db
+  // JSON-encoded Windows paths contain doubled backslashes in SQLite text.
+  // Search that representation too without broadening the project match.
+  const serializedRoot = JSON.stringify(project.rootPath).slice(1, -1);
+  let rows = db
     .prepare(`
       SELECT composerId, workspaceId, createdAt, lastUpdatedAt, value
       FROM composerHeaders
-      WHERE instr(value, ?) > 0 OR instr(value, ?) > 0
+      WHERE instr(value, ?) > 0 OR instr(value, ?) > 0 OR instr(value, ?) > 0
       ORDER BY lastUpdatedAt, composerId
     `)
-    .all(project.rootPath, encodedRoot) as Array<{
+    .all(project.rootPath, encodedRoot, serializedRoot) as Array<{
       composerId: string;
       workspaceId: string | null;
       createdAt: number | null;
       lastUpdatedAt: number | null;
       value: string;
     }>;
+  if (!rows.length) {
+    // A few Windows Cursor builds use a path serialization that SQLite's
+    // textual `instr` cannot match consistently. This bounded fallback still
+    // accepts only exact parsed repository identities below; it never widens
+    // retrieval to another project.
+    rows = db
+      .prepare(`
+        SELECT composerId, workspaceId, createdAt, lastUpdatedAt, value
+        FROM composerHeaders
+        ORDER BY lastUpdatedAt, composerId
+        LIMIT 10000
+      `)
+      .all() as typeof rows;
+  }
 
   const workspaces: WorkspaceInfo[] = [];
   for (const row of rows) {
