@@ -17,9 +17,9 @@ function memorixBinary(): string | null {
     "..",
     "node_modules",
     ".bin",
-    process.platform === "win32" ? "memorix.cmd" : "memorix",
+    "memorix",
   );
-  if (existsSync(local)) return local;
+  if (process.platform !== "win32" && existsSync(local)) return local;
   let directory = dirname(fileURLToPath(import.meta.url));
   for (let depth = 0; depth < 10; depth += 1) {
     const bundled = join(directory, "node_modules", "memorix", "dist", "cli", "index.js");

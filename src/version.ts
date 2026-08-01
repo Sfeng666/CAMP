@@ -1,2 +1,2 @@
-export const CAMP_VERSION = "0.1.4";
+export const CAMP_VERSION = "0.1.5";
 export const CAMP_LICENSE = "AGPL-3.0-or-later";

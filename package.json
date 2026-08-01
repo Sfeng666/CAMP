@@ -1,6 +1,6 @@
 {
   "name": "@camp-memory/cli",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Cross-Agent Memory for Projects — local-first project context for coding agents.",
   "license": "AGPL-3.0-or-later",
   "type": "module",
