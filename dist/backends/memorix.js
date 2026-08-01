@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
 import { spawnSync } from "node:child_process";
 import Database from "better-sqlite3";
 import { ensurePrivateDirectory, ensurePrivateFile } from "../paths.js";
@@ -10,6 +11,19 @@ function memorixBinary() {
     const local = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "node_modules", ".bin", "memorix");
     if (existsSync(local))
         return local;
+    // A packed scoped package lives below node_modules/@camp-memory/cli, so its
+    // sibling node_modules directory is not two levels above this file. Resolve
+    // the pinned dependency through Node instead of assuming an installation
+    // layout; this keeps `npm install -g @camp-memory/cli` self-contained.
+    try {
+        const entry = createRequire(import.meta.url).resolve("memorix");
+        const bundled = join(dirname(entry), "cli", "index.js");
+        if (existsSync(bundled))
+            return bundled;
+    }
+    catch {
+        // Fall through to an explicitly user-provided executable for development.
+    }
     return findCommand("memorix") ?? findCommand("memorix.cmd");
 }
 function memorixType(record) {

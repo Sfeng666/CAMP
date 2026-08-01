@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { DoctorCheck } from "./types.js";
 import type { CampStore } from "./store.js";
@@ -9,13 +9,23 @@ import { ensureLocalModels } from "./models.js";
 
 function packageVersion(name: string): string | null {
   const require = createRequire(import.meta.url);
-  const localManifest = resolve(dirname(fileURLToPath(import.meta.url)), "..", "node_modules", name, "package.json");
-  if (existsSync(localManifest)) {
-    try {
-      return (JSON.parse(readFileSync(localManifest, "utf8")) as { version?: string }).version ?? null;
-    } catch {
-      return null;
+  // Direct dependencies of a scoped, packed CLI are siblings of
+  // `@camp-memory/cli`, not children of it. Walk parent directories and check
+  // their node_modules folders so health reporting works after a normal npm
+  // install as well as from this repository.
+  let directory = dirname(fileURLToPath(import.meta.url));
+  for (let depth = 0; depth < 10; depth += 1) {
+    const manifestPath = join(directory, "node_modules", name, "package.json");
+    if (existsSync(manifestPath)) {
+      try {
+        return (JSON.parse(readFileSync(manifestPath, "utf8")) as { version?: string }).version ?? null;
+      } catch {
+        return null;
+      }
     }
+    const parent = dirname(directory);
+    if (parent === directory) break;
+    directory = parent;
   }
   try {
     const manifest = require(`${name}/package.json`) as { version?: string };
