@@ -113,7 +113,7 @@ Before release, benchmark CAMP against ChatCrystal, Memorix, AgentMemory, and
 Basic Memory with the same sanitized fixture. Publish the scope comparison and
 source links in the README, not unverified performance claims.
 
-Release `@camp-memory/cli@0.1.1` from a fresh `Sfeng666/CAMP` repository under
+Release `@camp-memory/cli@0.1.2` from a fresh `Sfeng666/CAMP` repository under
 AGPL-3.0-or-later. Preserve an auditable SQLite-safe export of any legacy PIMA
 data before explicit removal; only archive the old PIMA repository after CAMP
 passes clean-install and cross-agent acceptance tests.

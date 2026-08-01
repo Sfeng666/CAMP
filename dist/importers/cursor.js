@@ -15,11 +15,23 @@ function openReadonly(path) {
 }
 function decodeFolder(value) {
     let decoded;
-    try {
-        decoded = value.startsWith("file://") ? fileURLToPath(value) : decodeURIComponent(value.replace(/^file:\/\/\//, "/"));
+    if (/^file:\/\/[A-Za-z]:[\\/]/.test(value)) {
+        // Non-strict, drive-qualified records exist in older Cursor databases.
+        decoded = decodeURIComponent(value.slice("file://".length));
     }
-    catch {
-        decoded = decodeURIComponent(value.replace(/^file:\/\/\//, "/"));
+    else {
+        try {
+            decoded = value.startsWith("file://") ? fileURLToPath(value) : decodeURIComponent(value.replace(/^file:\/\/\//, "/"));
+        }
+        catch {
+            // Older Cursor records and test fixtures can contain `file://C:\\path`
+            // rather than a strict file URI. Keep the drive path intact on Windows;
+            // turning it into `/C:\\path` makes an exact workspace look unrelated.
+            const encoded = value.startsWith("file://") ? value.slice("file://".length) : value;
+            decoded = decodeURIComponent(process.platform === "win32" && /^\/[A-Za-z]:[\\/]/.test(encoded)
+                ? encoded.slice(1)
+                : encoded);
+        }
     }
     try {
         return realpathSync(decoded);

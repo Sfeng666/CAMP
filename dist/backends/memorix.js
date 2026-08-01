@@ -44,6 +44,11 @@ function memorixEnvironment(dataDir) {
         MEMORIX_AUTO_UPDATE: "off",
     };
 }
+function processError(result) {
+    const stderr = typeof result.stderr === "string" ? result.stderr : result.stderr?.toString("utf8") ?? "";
+    const stdout = typeof result.stdout === "string" ? result.stdout : result.stdout?.toString("utf8") ?? "";
+    return stderr.trim() || stdout.trim() || `memorix exited ${result.status}`;
+}
 export function matchMemorixObservations(records, observations) {
     const matched = [];
     const unmatched = [];
@@ -135,7 +140,7 @@ export function flushMemorix(store, project) {
             completed += 1;
         }
         else {
-            const error = result.stderr.trim() || result.stdout.trim() || `memorix exited ${result.status}`;
+            const error = processError(result);
             store.failOutbox(String(row.id), error);
             failed += 1;
             errors.push(error);
@@ -217,7 +222,7 @@ export function archiveMemorixProjectRecords(store, project) {
             deleted: 0,
             alreadyDeleted: 0,
             unavailable: true,
-            errors: [context.stderr.trim() || context.stdout.trim() || "Memorix project resolution failed"],
+            errors: [processError(context) || "Memorix project resolution failed"],
         };
     }
     let memorixProjectId = "";
@@ -325,7 +330,7 @@ export function archiveMemorixProjectRecords(store, project) {
                 deleted: 0,
                 alreadyDeleted,
                 unavailable: false,
-                errors: [result.stderr.trim() || result.stdout.trim() || `memorix exited ${result.status}`],
+                errors: [processError(result)],
             };
         }
     }

@@ -17,7 +17,7 @@ function listFiles(root, current = root) {
             files.push(...listFiles(root, path));
         else if (entry.isFile()) {
             files.push({
-                path: relative(root, path),
+                path: relative(root, path).replaceAll("\\", "/"),
                 size: statSync(path).size,
                 sha256: sha256(readFileSync(path)),
             });
@@ -64,7 +64,7 @@ export async function exportLegacyPima(output) {
             source.pragma("query_only = ON");
             Object.assign(counts, tableCounts(source));
             await source.backup(destinationDatabase);
-            database = relative(destination, destinationDatabase);
+            database = relative(destination, destinationDatabase).replaceAll("\\", "/");
         }
         finally {
             source.close();

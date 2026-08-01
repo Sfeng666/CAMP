@@ -84,7 +84,7 @@ export function readProjectHandoff(rootPath: string): {
     const goalLines = findSection(parsed, ["current goal", "goal"]);
     const goal = truncateByApproxTokens(redactForRecall(firstParagraph(goalLines)), 120);
     if (!goal) continue;
-    const displayPath = relative(rootPath, sourcePath);
+    const displayPath = relative(rootPath, sourcePath).replaceAll("\\", "/");
     const completed = listItems(findSection(parsed, ["what is implemented", "implemented", "completed"]));
     const historicalValidations = listItems(
       findSection(parsed, ["validation evidence", "validation", "verified"]),

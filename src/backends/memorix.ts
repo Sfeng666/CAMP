@@ -44,6 +44,12 @@ function memorixEnvironment(dataDir: string): NodeJS.ProcessEnv {
   };
 }
 
+function processError(result: { stderr?: string | Buffer | null; stdout?: string | Buffer | null; status: number | null }): string {
+  const stderr = typeof result.stderr === "string" ? result.stderr : result.stderr?.toString("utf8") ?? "";
+  const stdout = typeof result.stdout === "string" ? result.stdout : result.stdout?.toString("utf8") ?? "";
+  return stderr.trim() || stdout.trim() || `memorix exited ${result.status}`;
+}
+
 interface MemorixObservationRow {
   id: number;
   title: string;
@@ -167,7 +173,7 @@ export function flushMemorix(
       store.completeOutbox(String(row.id));
       completed += 1;
     } else {
-      const error = result.stderr.trim() || result.stdout.trim() || `memorix exited ${result.status}`;
+      const error = processError(result);
       store.failOutbox(String(row.id), error);
       failed += 1;
       errors.push(error);
@@ -257,7 +263,7 @@ export function archiveMemorixProjectRecords(
       deleted: 0,
       alreadyDeleted: 0,
       unavailable: true,
-      errors: [context.stderr.trim() || context.stdout.trim() || "Memorix project resolution failed"],
+      errors: [processError(context) || "Memorix project resolution failed"],
     };
   }
   let memorixProjectId = "";
@@ -380,7 +386,7 @@ export function archiveMemorixProjectRecords(
         deleted: 0,
         alreadyDeleted,
         unavailable: false,
-        errors: [result.stderr.trim() || result.stdout.trim() || `memorix exited ${result.status}`],
+        errors: [processError(result)],
       };
     }
   }
