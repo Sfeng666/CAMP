@@ -36,6 +36,18 @@ npm install -g @camp-memory/cli
 camp init /path/to/project
 ```
 
+If npm reports `EACCES` while creating `/usr/local/bin/camp`, use a
+user-owned prefix instead of `sudo`:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+npm install --global --prefix "$HOME/.local" @camp-memory/cli
+camp init /path/to/project
+```
+
+This keeps the installation inside your home directory and works on macOS and
+Linux without changing system-owned directories.
+
 That is the entire CAMP installation. The CLI package includes the command,
 MCP server, local archive, curated-memory store, daemon, agent adapters, and
 bundled ChatCrystal/Memorix integrations. `camp init` detects installed agents,
