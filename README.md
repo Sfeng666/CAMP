@@ -2,7 +2,7 @@
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/logo_dark.png">
     <source media="(prefers-color-scheme: light)" srcset="assets/logo_light.png">
-    <img src="assets/logo_light.png" width="168" alt="CAMP logo: four coding agents connected by shared project memory">
+    <img src="assets/logo_light.png" width="300" alt="CAMP logo: four coding agents connected by shared project memory">
   </picture>
 </p>
 
@@ -10,7 +10,7 @@
 
 <p align="center">
   <strong>Cross-Agent Memory for Projects</strong><br>
-  Shared project context for terminal, IDE, and desktop coding agents.
+  Shared project context for different coding agents.
 </p>
 
 <p align="center">
