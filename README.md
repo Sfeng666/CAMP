@@ -141,9 +141,9 @@ camp verify status <run-id> --json
 
 | Agent surface | CAMP integration | Verification status |
 | --- | --- | --- |
-| Codex CLI | MCP, hooks, incremental JSONL import | Live-verified on macOS in 0.1.8 as the receiving agent for a Cursor Agent CLI canary |
+| Codex CLI | MCP, hooks, incremental JSONL import | Live-verified on macOS as the receiving agent for a Cursor Agent CLI canary |
 | Claude Code | MCP, hooks, incremental JSONL import | Configured on the test Mac; awaiting supported credentials |
-| Cursor Agent CLI | MCP and exact-project transcript JSONL import | Live-verified on macOS in 0.1.8 as the source agent for a Codex CLI canary receipt |
+| Cursor Agent CLI | MCP and exact-project transcript JSONL import | Live-verified on macOS as the source agent for a Codex CLI canary receipt |
 | Cursor IDE | MCP and read-only VS Code database import | Contract-tested; desktop receipt test still pending |
 | Antigravity CLI | MCP, CLI plugin, hook transcript bridge | Contract-tested; live test blocked by the local Antigravity quota on 2026-08-12 |
 | Antigravity desktop | MCP, plugin, read-only transcript bridge | Receipt/canary contract-tested; desktop receipt test still pending |
@@ -223,7 +223,7 @@ same MCP client acknowledgment. Its compact handoffs remain provenance-backed,
 native agent databases remain read-only, ambiguous sessions remain
 quarantined, and one install configures all supported agents.
 
-On macOS, the local 0.1.8 packed artifact passed a live Cursor Agent CLI to
+On macOS, the packed artifact passed a live Cursor Agent CLI to
 Codex CLI canary test on 2026-08-12. CAMP imported one fresh Cursor session,
 bound its raw transcript to a project-scoped canary, and accepted Codex's
 same-client acknowledgment with `PASS`. The suite also exercises a sparse 6 GB
