@@ -444,6 +444,53 @@ describe("project registry and stores", () => {
     expect(store.getEvidence(record.id)?.state).toBe("stale");
   });
 
+  it("keeps equivalent historical handoffs when a newer candidate also becomes stale", () => {
+    // Reproduce the pre-v3 on-disk index before opening a new store. The
+    // constructor must migrate it without touching the project records.
+    store.db.exec(`
+      DROP INDEX IF EXISTS evidence_dedupe_idx;
+      CREATE UNIQUE INDEX evidence_dedupe_idx
+        ON evidence(project_id, kind, content_hash, state);
+      INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', '2');
+    `);
+    store.close();
+    store = new CampStore();
+    const dedupeIndex = store.db
+      .prepare("PRAGMA index_list(evidence)")
+      .all() as Array<{ name: string; unique: number }>;
+    expect(dedupeIndex.find((index) => index.name === "evidence_dedupe_idx")?.unique).toBe(0);
+
+    const root = join(env.root, "equivalent-handoffs");
+    mkdirSync(root);
+    const path = join(root, "policy.ts");
+    writeFileSync(path, "export const policy = 'first';\n");
+    const project = setupProject(store, root);
+    const input = {
+      projectId: project.id,
+      kind: "handoff" as const,
+      state: "candidate" as const,
+      title: "Current handoff: retain duplicate history safely",
+      content: "Goal: retain equivalent handoffs across stale-state transitions.",
+      confidence: 0.8,
+      sourceAgent: "camp" as const,
+      sourceSessionId: null,
+      sourceUri: null,
+      relevantFiles: ["policy.ts"],
+      commit: null,
+      worktreeFingerprint: null,
+    };
+    const first = store.putEvidence(input);
+    writeFileSync(path, "export const policy = 'second';\n");
+    expect(store.refreshStaleness(project.id)).toBe(1);
+    expect(store.getEvidence(first.id)?.state).toBe("stale");
+
+    const second = store.putEvidence(input);
+    expect(second.id).not.toBe(first.id);
+    writeFileSync(path, "export const policy = 'third';\n");
+    expect(store.refreshStaleness(project.id)).toBe(1);
+    expect(store.listEvidence(project.id).map((record) => record.state)).toEqual(["stale", "stale"]);
+  });
+
   it("verifies a one-time fallback-to-Memorix migration by count and content hash", () => {
     const root = join(env.root, "workspace");
     mkdirSync(root);

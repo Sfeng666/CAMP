@@ -1,4 +1,4 @@
-export declare const SCHEMA_VERSION: 2;
+export declare const SCHEMA_VERSION: 3;
 export type ProjectKind = "git" | "workspace";
 export type AgentSource = "codex" | "claude" | "cursor" | "antigravity" | "archive" | "unknown";
 /** Where the native agent session was captured. */

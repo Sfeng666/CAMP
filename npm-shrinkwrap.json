@@ -1,12 +1,12 @@
 {
   "name": "@camp-memory/cli",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "lockfileVersion": 3,
   "requires": true,
   "packages": {
     "": {
       "name": "@camp-memory/cli",
-      "version": "0.1.8",
+      "version": "0.1.9",
       "license": "AGPL-3.0-or-later",
       "dependencies": {
         "better-sqlite3": "12.11.1",
