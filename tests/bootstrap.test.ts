@@ -5,6 +5,7 @@ import { isolatedCamp, type IsolatedCamp } from "./helpers.js";
 import { bootstrapDatabase } from "../src/bootstrap.js";
 import { ensureCampDirectories, getCampPaths } from "../src/paths.js";
 import { hostPlatform } from "../src/platform.js";
+import { SCHEMA_VERSION } from "../src/types.js";
 
 describe("exclusive schema bootstrap", () => {
   let env: IsolatedCamp;
@@ -30,7 +31,7 @@ describe("exclusive schema bootstrap", () => {
     // nonzero mask even when the backup was written correctly.
     if (hostPlatform() !== "windows") expect(statSync(first.backup!).mode & 0o077).toBe(0);
     const migrated = new Database(paths.database, { readonly: true });
-    expect(migrated.prepare("SELECT value FROM meta WHERE key='schema_version'").pluck().get()).toBe("2");
+    expect(migrated.prepare("SELECT value FROM meta WHERE key='schema_version'").pluck().get()).toBe(String(SCHEMA_VERSION));
     migrated.close();
 
     expect(await bootstrapDatabase()).toEqual({ migrated: false, backup: null });

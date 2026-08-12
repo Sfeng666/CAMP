@@ -165,7 +165,7 @@ export class CampStore {
         updated_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS evidence_project_idx ON evidence(project_id, updated_at DESC);
-      CREATE UNIQUE INDEX IF NOT EXISTS evidence_dedupe_idx
+      CREATE INDEX IF NOT EXISTS evidence_dedupe_idx
         ON evidence(project_id, kind, content_hash, state);
       CREATE VIRTUAL TABLE IF NOT EXISTS evidence_fts USING fts5(
         title,
@@ -359,6 +359,20 @@ export class CampStore {
         const evidenceColumns = this.db.prepare("PRAGMA table_info(evidence)").all();
         if (!evidenceColumns.some((column) => column.name === "file_fingerprints_json")) {
             this.db.exec("ALTER TABLE evidence ADD COLUMN file_fingerprints_json TEXT NOT NULL DEFAULT '{}'");
+        }
+        const storedSchemaVersion = Number(this.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get()
+            ?.value ?? "0");
+        if (storedSchemaVersion < 3) {
+            // A content-identical handoff can legitimately exist in both a historic
+            // stale record and a newer candidate record. Its later state transition
+            // must not fail the source sync. New writes are still deduplicated by
+            // putEvidence's exact state lookup; this index is for lookup speed, not
+            // cross-state uniqueness.
+            this.db.exec(`
+        DROP INDEX IF EXISTS evidence_dedupe_idx;
+        CREATE INDEX evidence_dedupe_idx
+          ON evidence(project_id, kind, content_hash, state);
+      `);
         }
         const messageColumns = this.db.prepare("PRAGMA table_info(messages)").all();
         if (!messageColumns.some((column) => column.name === "content_hash")) {

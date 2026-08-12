@@ -141,7 +141,7 @@ AgentMemory, and Basic Memory with the same sanitized fixture. Publish the
 scope comparison and source links in the README, not unverified performance
 claims.
 
-Release `@camp-memory/cli@0.1.8` under the npm `next` tag only after the packed
+Release `@camp-memory/cli@0.1.9` under the npm `next` tag only after the packed
 package passes automated checks and a live canary matrix. On 2026-08-12, the
 packed local artifact passed `npm run check` and a real Cursor Agent CLI to
 Codex CLI canary: one exact-project Cursor transcript was imported, then a

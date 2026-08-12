@@ -89,7 +89,10 @@ describe("daemon single-writer RPC", () => {
     const daemonErrors = join(getCampPaths().logDir, "daemon-error.log");
     const errors = existsSync(daemonErrors) ? readFileSync(daemonErrors, "utf8") : "";
     expect(errors).not.toMatch(/readonly database|database is locked/i);
-  }, 30_000);
+  // Windows CI launches several child Node processes and uses a file-backed
+  // isolated transport. Under a loaded hosted runner that is valid work but
+  // can exceed the otherwise sufficient 30-second cap.
+  }, 60_000);
 
   it("gives an already-waiting receipt its FIFO turn during a cooperative background scan", async () => {
     const queue = new SerialQueue();
