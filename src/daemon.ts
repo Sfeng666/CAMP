@@ -314,10 +314,15 @@ export async function runDaemon(intervalMs = 60_000): Promise<void> {
     if (process.platform !== "win32" && existsSync(endpoint)) unlinkSync(endpoint);
     const descriptor = join(store.paths.runtimeDir, "rpc-endpoint.json");
     if (existsSync(descriptor)) unlinkSync(descriptor);
+    // Keep the writer lock until SQLite is fully closed. On POSIX an open
+    // database can be unlinked, which masked the race; Windows correctly
+    // rejects the deletion. The lock is also the signal used by upgrade and
+    // test callers, so releasing it only after the handle closes is the
+    // accurate lifecycle boundary on every host.
+    store.close();
     closeSync(lock.descriptor);
     if (existsSync(lock.path)) unlinkSync(lock.path);
     if (localModelServer && !localModelServer.killed) localModelServer.kill("SIGTERM");
-    store.close();
     process.off("SIGINT", stop);
     process.off("SIGTERM", stop);
   }
