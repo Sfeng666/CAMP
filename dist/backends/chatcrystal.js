@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { ensurePrivateDirectory, ensurePrivateFile } from "../paths.js";
 import { nowIso } from "../utils.js";
 import { redactForRecall } from "../redaction.js";
@@ -24,7 +24,10 @@ function workerInvocation(mode, projectId) {
         const worker = fileURLToPath(new URL("./chatcrystal-worker.ts", import.meta.url));
         return {
             command: process.execPath,
-            args: ["--import", loader, worker, mode, ...(projectId ? [projectId] : [])],
+            // --import consumes an ESM specifier, not a command-line filesystem
+            // path. A file URL keeps this child process valid on Windows drive
+            // letters while the worker entrypoint remains a normal native path.
+            args: ["--import", pathToFileURL(loader).href, worker, mode, ...(projectId ? [projectId] : [])],
         };
     }
     const worker = fileURLToPath(new URL("./chatcrystal-worker.js", import.meta.url));

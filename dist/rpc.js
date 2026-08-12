@@ -4,7 +4,7 @@ import { existsSync, closeSync, openSync, readdirSync, readFileSync, unlinkSync,
 import { join } from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { bootstrapDatabase } from "./bootstrap.js";
 import { ensureCampDirectories, ensurePrivateDirectory, ensurePrivateFile, getCampPaths, } from "./paths.js";
 import { hostPlatform } from "./platform.js";
@@ -107,7 +107,11 @@ function invocation() {
     const current = process.argv[1];
     if (current && current.endsWith(".ts")) {
         const loader = fileURLToPath(new URL("../node_modules/tsx/dist/loader.mjs", import.meta.url));
-        return { command: process.execPath, args: ["--import", loader, current, "daemon"] };
+        // Node treats values passed to --import as module specifiers. A native
+        // Windows drive path is therefore parsed as a d: URL scheme instead of a
+        // file path. Keep the executable entrypoint native, but make the loader
+        // an explicit file URL on every host.
+        return { command: process.execPath, args: ["--import", pathToFileURL(loader).href, current, "daemon"] };
     }
     if (current)
         return { command: process.execPath, args: [current, "daemon"] };
@@ -357,7 +361,11 @@ export async function startRpcServer(handler) {
     const descriptor = endpointDescriptor();
     if (existsSync(descriptor))
         unlinkSync(descriptor);
-    if (process.env.CAMP_USER_HOME && getCampPaths().platform !== "windows" && process.env.CAMP_USER_HOME !== homedir()) {
+    // Isolated tests, portable installs, and sandboxed agent hosts have a
+    // private CAMP_USER_HOME. The private filesystem transport is more robust
+    // than a platform socket there and works on Windows as well. Normal Windows
+    // installs continue to use their named pipe below.
+    if (process.env.CAMP_USER_HOME && process.env.CAMP_USER_HOME !== homedir()) {
         return fileRpcServer(handler, token, descriptor);
     }
     if (hostPlatform() !== "windows" && existsSync(endpoint))

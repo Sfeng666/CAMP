@@ -19,6 +19,9 @@ describe("safe IDE integration", () => {
     env = isolatedCamp();
     mkdirSync(join(env.user, ".codex"), { recursive: true });
     mkdirSync(join(env.user, ".cursor"), { recursive: true });
+    // Presence of the Claude directory is the supported lightweight install
+    // signal when the command is intentionally absent from this fixture.
+    mkdirSync(join(env.user, ".claude"), { recursive: true });
     mkdirSync(join(env.user, ".gemini", "antigravity-ide"), { recursive: true });
     writeFileSync(join(env.user, ".codex", "config.toml"), "model = \"fixture\"\n");
     writeFileSync(

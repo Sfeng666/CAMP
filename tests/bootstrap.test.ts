@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { isolatedCamp, type IsolatedCamp } from "./helpers.js";
 import { bootstrapDatabase } from "../src/bootstrap.js";
 import { ensureCampDirectories, getCampPaths } from "../src/paths.js";
+import { hostPlatform } from "../src/platform.js";
 
 describe("exclusive schema bootstrap", () => {
   let env: IsolatedCamp;
@@ -24,7 +25,10 @@ describe("exclusive schema bootstrap", () => {
     const first = await bootstrapDatabase();
     expect(first.migrated).toBe(true);
     expect(first.backup && existsSync(first.backup)).toBe(true);
-    expect(statSync(first.backup!).mode & 0o077).toBe(0);
+    // Windows exposes ACLs rather than POSIX permission masks. CAMP requests
+    // a private ACL there, but a Unix-mode assertion would report a synthetic
+    // nonzero mask even when the backup was written correctly.
+    if (hostPlatform() !== "windows") expect(statSync(first.backup!).mode & 0o077).toBe(0);
     const migrated = new Database(paths.database, { readonly: true });
     expect(migrated.prepare("SELECT value FROM meta WHERE key='schema_version'").pluck().get()).toBe("2");
     migrated.close();

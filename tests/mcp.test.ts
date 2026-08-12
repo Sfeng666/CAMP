@@ -1,5 +1,6 @@
 import { mkdirSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { spawnSync } from "node:child_process";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -48,7 +49,7 @@ describe("composite MCP receipt surface", () => {
 
     const transport = new StdioClientTransport({
       command: process.execPath,
-      args: ["--import", resolve("node_modules", "tsx", "dist", "loader.mjs"), SOURCE, "mcp"],
+      args: ["--import", pathToFileURL(resolve("node_modules", "tsx", "dist", "loader.mjs")).href, SOURCE, "mcp"],
       cwd: root,
       env: variables,
       stderr: "pipe",
