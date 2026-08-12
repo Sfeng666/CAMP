@@ -33,7 +33,7 @@ function databaseMentionsProject(path, project) {
     }
     return false;
 }
-async function importHookSpool(store, project, summary) {
+async function importHookSpool(store, project, summary, cooperate = async () => undefined) {
     const path = join(getCampPaths().spoolDir, "hooks.jsonl");
     if (!existsSync(path))
         return;
@@ -78,8 +78,9 @@ async function importHookSpool(store, project, summary) {
         if (item)
             list.push(item);
         grouped.set(sessionId, list);
-    });
+    }, cooperate);
     for (const [nativeId, messages] of grouped) {
+        await cooperate();
         if (!messages.length)
             continue;
         summary.scanned += 1;
@@ -93,7 +94,7 @@ async function importHookSpool(store, project, summary) {
             sourcePath: path,
             messages,
         });
-        const result = store.storeSession(session);
+        const result = await store.storeSessionAsync(session, cooperate);
         summary[result.status] += 1;
     }
 }
@@ -136,13 +137,14 @@ function transcriptMessage(entry, sequence, sourceLine) {
         metadata: { sourceLine, transcriptFormat: "antigravity-transcript@1", type: type || null },
     });
 }
-async function importNativeTranscripts(store, project, summary, roots = antigravityRoots()) {
+async function importNativeTranscripts(store, project, summary, roots = antigravityRoots(), cooperate = async () => undefined) {
     for (const root of roots) {
         if (!existsSync(root))
             continue;
         const surface = /antigravity-cli/.test(root) ? "cli" : /antigravity[\\/]brain/.test(root) ? "desktop" : "unknown";
         const transcripts = (await walkFiles(root, [".jsonl"], 9)).filter((path) => basename(path) === "transcript.jsonl");
         for (const path of transcripts) {
+            await cooperate();
             summary.scanned += 1;
             const messages = [];
             const paths = new Set();
@@ -160,7 +162,7 @@ async function importNativeTranscripts(store, project, summary, roots = antigrav
                 const item = transcriptMessage(entry, messages.length, sourceLine);
                 if (item)
                     messages.push(item);
-            });
+            }, cooperate);
             const exact = [...paths].some((workspace) => isInsidePath(workspace, project.rootPath));
             const parent = [...paths].some((workspace) => isInsidePath(project.rootPath, workspace));
             if (!exact) {
@@ -207,13 +209,13 @@ async function importNativeTranscripts(store, project, summary, roots = antigrav
                 messages,
                 metadata: { workspacePaths: [...paths], adapter: "antigravity-transcript@1" },
             });
-            const result = store.storeSession(session);
+            const result = await store.storeSessionAsync(session, cooperate);
             summary[result.status] += 1;
             store.setCheckpoint(project.id, "antigravity", checkpoint, sourceFingerprint);
         }
     }
 }
-export async function importAntigravity(store, project, root = process.env.ANTIGRAVITY_DATA_DIR ?? join(userHome(), ".gemini", "antigravity-ide")) {
+export async function importAntigravity(store, project, root = process.env.ANTIGRAVITY_DATA_DIR ?? join(userHome(), ".gemini", "antigravity-ide"), cooperate = async () => undefined) {
     const summary = {
         source: "antigravity",
         scanned: 0,
@@ -223,11 +225,12 @@ export async function importAntigravity(store, project, root = process.env.ANTIG
         quarantined: 0,
         errors: [],
     };
-    await importHookSpool(store, project, summary);
-    await importNativeTranscripts(store, project, summary);
+    await importHookSpool(store, project, summary, cooperate);
+    await importNativeTranscripts(store, project, summary, undefined, cooperate);
     if (!existsSync(root))
         return summary;
     for (const path of await walkFiles(root, [".db", ".sqlite", ".sqlite3"], 8)) {
+        await cooperate();
         summary.scanned += 1;
         if (!databaseMentionsProject(path, project))
             continue;

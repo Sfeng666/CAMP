@@ -225,7 +225,7 @@ function retryModelList(binary, attempts = 12) {
 /** Keep the local Ollama server as a child of CAMP's user service. */
 export function startLocalModelServer() {
     const binary = ollamaBinary();
-    if (!binary || !listModels(binary).error)
+    if (!binary)
         return null;
     try {
         const child = spawn(binary, ["serve"], {
@@ -233,7 +233,6 @@ export function startLocalModelServer() {
             env: process.env,
         });
         child.on("error", () => undefined);
-        retryModelList(binary);
         return child;
     }
     catch {

@@ -14,6 +14,10 @@ export interface CampPaths {
     registryExport: string;
     machineConfig: string;
     modelManifest: string;
+    rpcToken: string;
+    receiptKey: string;
+    daemonLock: string;
+    migrationLock: string;
 }
 export declare function getCampPaths(): CampPaths;
 export declare function ensurePrivateDirectory(path: string): void;

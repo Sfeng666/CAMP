@@ -32,6 +32,7 @@ export function isolatedCamp(): IsolatedCamp {
       delete process.env.CAMP_CONFIG_HOME;
       delete process.env.CAMP_STATE_HOME;
       delete process.env.CAMP_HOST_PLATFORM;
+      delete process.env.CAMP_RPC_FORCE_LOOPBACK;
       delete process.env.CAMP_USER_HOME;
       delete process.env.CURSOR_DATA_DIR;
       delete process.env.CURSOR_PROJECTS_DIR;

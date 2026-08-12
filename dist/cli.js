@@ -1,25 +1,19 @@
 #!/usr/bin/env node
 import { Command } from "commander";
-import { spawn } from "node:child_process";
-import { basename, join, resolve } from "node:path";
-import { existsSync, readFileSync, rmSync, unlinkSync } from "node:fs";
+import { resolve } from "node:path";
+import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
-import { inspectProject, changedPaths } from "./git.js";
-import { CampStore } from "./store.js";
-import { resolveProject, setupProject, portableProjectId, writePortableManifest } from "./registry.js";
-import { detectClients, installIntegrations, installUserService, removeIntegrations, removeUserService } from "./integrations.js";
-import { syncProject } from "./sync.js";
-import { runDoctor } from "./doctor.js";
+import { inspectProject } from "./git.js";
+import { portableProjectId, writePortableManifest } from "./registry.js";
+import { detectClients, installIntegrations, installUserService, removeIntegrations, removeUserService, } from "./integrations.js";
 import { acknowledgeEmbeddingReindex, ensureLocalModels } from "./models.js";
 import { getCampPaths } from "./paths.js";
 import { exportLegacyPima } from "./legacy.js";
-import { finalizeMemorixMigration, archiveMemorixProjectRecords, queueMemorix, flushMemorix, prepareMemorixMigration, } from "./backends/memorix.js";
 import { runMcpServer } from "./mcp.js";
 import { runDaemon } from "./daemon.js";
-import { captureHook } from "./hook.js";
-import { hybridSearch } from "./semantic.js";
-import { purgeChatCrystalProject } from "./backends/chatcrystal.js";
+import { callDaemon, defaultRpcIdentity, ensureDaemon, rpcCall, waitForDaemonExit, } from "./rpc.js";
+import { bootstrapDatabase } from "./bootstrap.js";
 import { CAMP_VERSION } from "./version.js";
 const VERSION = CAMP_VERSION;
 const MINIMUM_NODE = [22, 18, 0];
@@ -45,6 +39,24 @@ function line(value = "") {
 function sourceSummary(summary) {
     return `${summary.source}: scanned=${summary.scanned} imported=${summary.imported} replaced=${summary.replaced} skipped=${summary.skipped} quarantined=${summary.quarantined} errors=${summary.errors.length}`;
 }
+function pathOwner() {
+    return { paths: getCampPaths() };
+}
+async function bootstrapAfterDaemonStop() {
+    let last = null;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+        try {
+            return await bootstrapDatabase();
+        }
+        catch (error) {
+            last = error;
+            if (!/(?:still owns the pre-v\d+ database|schema migration is already owned|acquire the schema migration lock)/i.test(error instanceof Error ? error.message : String(error)))
+                throw error;
+            await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
+        }
+    }
+    throw last;
+}
 async function confirmPurge(projectPath) {
     if (!process.stdin.isTTY)
         return false;
@@ -58,39 +70,13 @@ async function confirmPurge(projectPath) {
     }
 }
 function parseAgent(value) {
-    const allowed = new Set([
-        "codex",
-        "claude",
-        "cursor",
-        "antigravity",
-        "archive",
-        "unknown",
-    ]);
+    const allowed = new Set(["codex", "claude", "cursor", "antigravity", "archive", "unknown"]);
     if (!allowed.has(value))
         throw new Error(`Unsupported agent: ${value}`);
     return value;
 }
-function startBackgroundSync(projectId, cwd) {
-    const script = process.argv[1];
-    if (!script || !existsSync(script))
-        return false;
-    const args = script.endsWith(".ts")
-        ? ["--import", "tsx", script, "sync", projectId, "--once"]
-        : [script, "sync", projectId, "--once"];
-    const child = spawn(process.execPath, args, {
-        cwd,
-        detached: true,
-        env: process.env,
-        stdio: "ignore",
-    });
-    child.unref();
-    return true;
-}
 const program = new Command();
-program
-    .name("camp")
-    .description("CAMP — Cross-Agent Memory for Projects")
-    .version(VERSION);
+program.name("camp").description("CAMP — Cross-Agent Memory for Projects").version(VERSION);
 program
     .command("init")
     .description("Register a project, configure installed agents, and import matching history")
@@ -110,68 +96,33 @@ program
         });
         return;
     }
-    const store = new CampStore();
-    try {
-        const project = setupProject(store, path);
-        line(`Registered ${project.id} (${project.kind})`);
-        line(`Project: ${project.rootPath}`);
-        if (options.portable)
-            line(`Portable manifest: ${writePortableManifest(project)}`);
-        const integrations = installIntegrations(store);
-        for (const item of integrations)
-            line(`${item.client}: ${item.status} — ${item.detail}`);
-        if (!store.latestHandoff(project.id)) {
-            const paths = changedPaths(project.rootPath);
-            const record = store.createHandoff(project, {
-                goal: `Continue development in ${basename(project.rootPath)}`,
-                completed: [],
-                changedPaths: paths,
-                validations: [],
-                unresolved: paths.length
-                    ? ["The worktree is dirty; historical status and validation must be rechecked before edits"]
-                    : [],
-                nextSteps: ["Inspect current project files and retrieve task-specific CAMP context"],
-                sourceSessions: store.listSessionIds(project.id).slice(-5),
-            });
-            queueMemorix(store, project, record);
-        }
-        prepareMemorixMigration(store, project);
-        flushMemorix(store, project);
-        finalizeMemorixMigration(store, project);
-        const liveMachineBootstrap = !process.env.CAMP_USER_HOME || resolve(process.env.CAMP_USER_HOME) === resolve(process.env.HOME ?? "");
-        const models = ensureLocalModels(liveMachineBootstrap, liveMachineBootstrap);
-        if (!models.available || models.missing.length) {
-            line(`models: degraded — ${models.actions.join("; ")}`);
-        }
-        else {
-            line("models: ready");
-        }
-        const service = installUserService(store, true);
-        line(`daemon: ${service.active ? "active" : "written"} — ${service.detail}`);
-        if (options.import) {
-            if (process.env.CAMP_SETUP_FOREGROUND === "1") {
-                const result = await syncProject(store, project, (summary) => line(sourceSummary(summary)));
-                if (result.chatcrystal) {
-                    line(`chatcrystal: imported=${result.chatcrystal.imported} replaced=${result.chatcrystal.replaced} skipped=${result.chatcrystal.skipped} errors=${result.chatcrystal.errors}`);
-                }
-                for (const error of result.errors)
-                    line(`degraded: ${error}`);
-            }
-            else if (service.active) {
-                line(`history: indexing continues resumably in the ${service.kind} CAMP daemon`);
-            }
-            else if (startBackgroundSync(project.id, project.rootPath)) {
-                line("history: indexing started in a detached local sync process");
-            }
-            else {
-                line("history: indexing pending — run camp sync --once");
-            }
-        }
-        line(`Run: camp status ${JSON.stringify(project.rootPath)}`);
+    const owner = pathOwner();
+    const integrations = installIntegrations(owner);
+    const service = installUserService(owner, true);
+    await ensureDaemon(service.active ? 30_000 : 5_000);
+    const setup = await rpcCall("setup", { path, import: options.import });
+    const project = setup.project;
+    line(`Registered ${project.id} (${project.kind})`);
+    line(`Project: ${project.rootPath}`);
+    if (options.portable)
+        line(`Portable manifest: ${writePortableManifest(project)}`);
+    for (const item of integrations)
+        line(`${item.client}: ${item.status} — ${item.detail}`);
+    const liveMachineBootstrap = !process.env.CAMP_USER_HOME || resolve(process.env.CAMP_USER_HOME) === resolve(process.env.HOME ?? "");
+    const models = ensureLocalModels(liveMachineBootstrap, liveMachineBootstrap);
+    line(!models.available || models.missing.length
+        ? `models: degraded — ${models.actions.join("; ")}`
+        : "models: ready");
+    line(`daemon: ${service.active ? "active" : "session"} — ${service.detail}`);
+    if (options.import && process.env.CAMP_SETUP_FOREGROUND === "1") {
+        const result = await rpcCall("sync", { project: project.id }, defaultRpcIdentity(), 10 * 60_000);
+        result.imports.forEach((summary) => line(sourceSummary(summary)));
+        result.errors.forEach((error) => line(`degraded: ${error}`));
     }
-    finally {
-        store.close();
+    else if (options.import) {
+        line("history: indexing continues resumably in the CAMP daemon");
     }
+    line(`Run: camp status ${JSON.stringify(project.rootPath)}`);
 });
 program
     .command("sync")
@@ -180,47 +131,35 @@ program
     .option("--once", "Perform one synchronization pass")
     .option("--json", "Emit JSON")
     .action(async (path, options) => {
-    const store = new CampStore();
-    try {
-        const project = resolveProject(store, path);
-        const result = await syncProject(store, project, options.json ? undefined : (summary) => line(sourceSummary(summary)));
-        if (options.json)
-            json(result);
-        else {
-            if (result.chatcrystal)
-                line(`chatcrystal: ${JSON.stringify(result.chatcrystal)}`);
-            line(`memorix: ${JSON.stringify(result.memorix)}`);
-            result.errors.forEach((value) => line(`degraded: ${value}`));
-        }
-    }
-    finally {
-        store.close();
+    const result = await callDaemon("sync", { project: path }, undefined, 10 * 60_000);
+    if (options.json)
+        json(result);
+    else {
+        result.imports.forEach((summary) => line(sourceSummary(summary)));
+        if (result.chatcrystal)
+            line(`chatcrystal: ${JSON.stringify(result.chatcrystal)}`);
+        line(`memorix: ${JSON.stringify(result.memorix)}`);
+        result.errors.forEach((error) => line(`degraded: ${error}`));
     }
 });
 program
     .command("status")
-    .description("Show project archive and memory status")
+    .description("Show project archive, freshness, and memory status")
     .argument("[path]", "Registered project path or UUID", ".")
     .option("--json", "Emit JSON")
-    .action((path, options) => {
-    const store = new CampStore();
-    try {
-        const project = resolveProject(store, path);
-        const status = store.projectStatus(project.id);
-        if (options.json)
-            json(status);
-        else {
-            line(`${project.rootPath} (${project.id})`);
-            line(`kind=${project.kind} sessions=${status.sessions} messages=${status.messages} evidence=${status.evidence}`);
-            line(`quarantined=${status.quarantined} last_import=${status.lastImportedAt ?? "never"}`);
-            line(`sources=${JSON.stringify(status.bySource)}`);
-            const degraded = status.health.filter((item) => item.status === "degraded");
-            if (degraded.length)
-                line(`degraded=${JSON.stringify(degraded)}`);
-        }
-    }
-    finally {
-        store.close();
+    .action(async (path, options) => {
+    const status = await callDaemon("status", { project: path });
+    if (options.json)
+        json(status);
+    else {
+        line(`${status.project.rootPath} (${status.project.id})`);
+        line(`kind=${status.project.kind} sessions=${status.sessions} messages=${status.messages} evidence=${status.evidence}`);
+        line(`quarantined=${status.quarantined} last_import=${status.lastImportedAt ?? "never"}`);
+        line(`sources=${JSON.stringify(status.bySource)}`);
+        status.freshness.forEach((item) => line(`freshness:${item.source} status=${item.status} lag=${item.lagSeconds ?? "never"}s last_success=${item.lastSuccessfulScanAt ?? "never"}`));
+        const degraded = status.health.filter((item) => item.status === "degraded");
+        if (degraded.length)
+            line(`degraded=${JSON.stringify(degraded)}`);
     }
 });
 program
@@ -229,26 +168,19 @@ program
     .option("--json", "Emit JSON")
     .option("--repair", "Repair CAMP-owned integrations and pull missing local models")
     .action(async (options) => {
-    const store = new CampStore();
-    try {
-        const repairs = [];
-        if (options.repair) {
-            repairs.push(...installIntegrations(store));
-            repairs.push(ensureLocalModels(true, true));
-            repairs.push(installUserService(store, true));
-        }
-        const checks = await runDoctor(store);
-        if (options.json)
-            json({ checks, repairs });
-        else {
-            checks.forEach((check) => line(`${check.status.padEnd(8)} ${check.name}: ${check.detail}`));
-        }
-        if (checks.some((check) => check.status === "error"))
-            process.exitCode = 1;
+    const repairs = [];
+    if (options.repair) {
+        repairs.push(...installIntegrations(pathOwner()));
+        repairs.push(ensureLocalModels(true, true));
+        repairs.push(installUserService(pathOwner(), true));
     }
-    finally {
-        store.close();
-    }
+    const checks = await callDaemon("doctor");
+    if (options.json)
+        json({ checks, repairs });
+    else
+        checks.forEach((check) => line(`${check.status.padEnd(8)} ${check.name}: ${check.detail}`));
+    if (checks.some((check) => check.status === "error"))
+        process.exitCode = 1;
 });
 program
     .command("review")
@@ -256,26 +188,17 @@ program
     .argument("[path]", "Registered project path or UUID", ".")
     .option("--assign <quarantine-id>", "Assign a quarantined source to this project")
     .option("--json", "Emit JSON")
-    .action((path, options) => {
-    const store = new CampStore();
-    try {
-        const project = resolveProject(store, path);
-        if (options.assign) {
-            const resolved = store.resolveQuarantine(options.assign, project.id);
-            if (!resolved)
-                throw new Error(`Open quarantine item not found: ${options.assign}`);
-        }
-        const items = store.listQuarantine(project.id);
-        if (options.json)
-            json(items);
-        else if (!items.length)
-            line("No open quarantine items.");
-        else
-            items.forEach((item) => line(`${item.id} ${item.source}: ${item.reason}\n  ${item.source_path}`));
-    }
-    finally {
-        store.close();
-    }
+    .action(async (path, options) => {
+    const items = await callDaemon("review", {
+        project: path,
+        assign: options.assign,
+    });
+    if (options.json)
+        json(items);
+    else if (!items.length)
+        line("No open quarantine items.");
+    else
+        items.forEach((item) => line(`${item.id} ${item.source}: ${item.reason}\n  ${item.source_path}`));
 });
 program
     .command("search")
@@ -286,21 +209,16 @@ program
     .option("--limit <number>", "Maximum results", "20")
     .option("--json", "Emit JSON")
     .action(async (query, options) => {
-    const store = new CampStore();
-    try {
-        const project = resolveProject(store, options.project);
-        const source = new Set(["raw", "curated", "all"]).has(options.source)
-            ? options.source
-            : "all";
-        const hits = await hybridSearch(store, project.id, query, source, Math.max(1, Math.min(50, Number(options.limit))));
-        if (options.json)
-            json(hits);
-        else
-            hits.forEach((hit) => line(`[${hit.layer}/${hit.source}] ${hit.title}\n${hit.content}\n${hit.uri}\n`));
-    }
-    finally {
-        store.close();
-    }
+    const hits = await callDaemon("search", {
+        project: options.project,
+        query,
+        source: options.source,
+        limit: Number(options.limit),
+    });
+    if (options.json)
+        json(hits);
+    else
+        hits.forEach((hit) => line(`[${hit.layer}/${hit.source}] ${hit.title}\n${hit.content}\n${hit.uri}\n`));
 });
 program
     .command("handoff")
@@ -312,31 +230,48 @@ program
     .option("--unresolved <item...>", "Unresolved issues")
     .option("--next <item...>", "Recommended next steps")
     .option("--json", "Emit JSON")
-    .action((path, options) => {
-    const store = new CampStore();
-    try {
-        const project = resolveProject(store, path);
-        const handoff = {
-            goal: options.task ?? `Continue development in ${basename(project.rootPath)}`,
-            completed: options.completed ?? [],
-            changedPaths: changedPaths(project.rootPath),
-            validations: options.validation ?? [],
-            unresolved: options.unresolved ?? [],
-            nextSteps: options.next ?? [],
-            sourceSessions: store.listSessionIds(project.id).slice(-5),
-        };
-        const record = store.createHandoff(project, handoff);
-        queueMemorix(store, project, record);
-        const backend = flushMemorix(store, project);
-        if (options.json)
-            json({ record, memorix: backend });
-        else
-            line(`Created handoff ${record.id}; Memorix completed=${backend.completed} failed=${backend.failed}`);
-    }
-    finally {
-        store.close();
-    }
+    .action(async (path, options) => {
+    const result = await callDaemon("createHandoff", {
+        project: path,
+        goal: options.task,
+        completed: options.completed,
+        validations: options.validation,
+        unresolved: options.unresolved,
+        nextSteps: options.next,
+    });
+    if (options.json)
+        json(result);
+    else
+        line(`Created handoff ${result.record.id}`);
 });
+program
+    .command("context-status")
+    .description("Inspect a context receipt and its acknowledgment without exposing the challenge")
+    .requiredOption("--receipt <id>", "Context receipt ID")
+    .option("--json", "Emit JSON")
+    .action(async (options) => {
+    const result = await callDaemon("contextStatus", { receiptId: options.receipt });
+    if (options.json)
+        json(result);
+    else
+        line(JSON.stringify(result, null, 2));
+});
+const verify = program.command("verify").description("Inspect or cancel an expiring cross-agent canary");
+verify
+    .command("status")
+    .argument("<run-id>", "Verification run ID")
+    .option("--json", "Emit JSON")
+    .action(async (runId, options) => {
+    const result = await callDaemon("verificationStatus", { runId });
+    if (options.json)
+        json(result);
+    else
+        line(JSON.stringify(result, null, 2));
+});
+verify
+    .command("cancel")
+    .argument("<run-id>", "Verification run ID")
+    .action(async (runId) => json(await callDaemon("cancelVerification", { runId })));
 program
     .command("remove")
     .description("Unregister a project; keep data unless --purge is explicitly confirmed")
@@ -344,55 +279,50 @@ program
     .option("--purge", "Permanently delete this project's CAMP data")
     .option("--confirm <project-id>", "Confirm purge with the exact registered project UUID")
     .action(async (path, options) => {
-    const store = new CampStore();
-    try {
-        const project = resolveProject(store, path);
-        if (options.purge &&
-            options.confirm !== project.id &&
-            !(await confirmPurge(project.rootPath))) {
-            throw new Error("Purge was not confirmed; no data was deleted");
-        }
-        if (options.purge) {
-            const memorix = archiveMemorixProjectRecords(store, project);
-            if (memorix.unavailable || memorix.errors.length) {
-                throw new Error(`Memorix purge gate failed: ${memorix.errors.join("; ")}`);
-            }
-            line(`memorix: deleted=${memorix.deleted} already_deleted=${memorix.alreadyDeleted}`);
-            await purgeChatCrystalProject(store, project);
-        }
-        store.unregisterProject(project.id, Boolean(options.purge));
-        if (options.purge) {
-            const archive = join(store.paths.archiveDir, project.id);
-            if (existsSync(archive))
-                rmSync(archive, { recursive: true, force: false });
-        }
-        const portable = resolve(project.rootPath, ".camp", "project.toml");
-        if (portableProjectId(project.rootPath) === project.id && existsSync(portable))
-            unlinkSync(portable);
-        if (!store.listProjects().length) {
-            removeIntegrations(store).forEach((result) => line(`${result.client}: ${result.detail}`));
-            line(removeUserService(store));
-        }
-        line(options.purge ? "Project data purged" : "Project unregistered; archive retained");
+    const status = await callDaemon("status", { project: path });
+    const project = status.project;
+    if (options.purge && options.confirm !== project.id && !(await confirmPurge(project.rootPath))) {
+        throw new Error("Purge was not confirmed; no data was deleted");
     }
-    finally {
-        store.close();
+    const result = await callDaemon("remove", {
+        project: project.id,
+        purge: Boolean(options.purge),
+    });
+    const portable = resolve(project.rootPath, ".camp", "project.toml");
+    if (portableProjectId(project.rootPath) === project.id && existsSync(portable))
+        unlinkSync(portable);
+    if (!result.remainingProjects) {
+        await rpcCall("shutdown").catch(() => undefined);
+        removeIntegrations(pathOwner()).forEach((item) => line(`${item.client}: ${item.detail}`));
+        line(removeUserService(pathOwner()));
     }
+    line(options.purge ? "Project data purged" : "Project unregistered; archive retained");
 });
 program
     .command("upgrade")
-    .description("Inspect or apply backend compatibility upgrades")
+    .description("Inspect or apply backend compatibility and schema upgrades")
     .option("--check", "Show pinned versions and upgrade policy")
-    .option("--apply", "Apply a compatibility-tested CAMP release upgrade")
-    .action((options) => {
-    json({
-        camp: VERSION,
-        pins: { chatcrystal: "0.5.8", memorix: "1.3.1", "better-sqlite3": "12.11.1" },
-        applied: false,
-        detail: options.apply
-            ? "Backend pins change only in a compatibility-tested CAMP release; no unreviewed upgrade was applied."
-            : "All backend versions are locked by package-lock.json.",
-    });
+    .option("--apply", "Apply the compatibility-tested CAMP release upgrade")
+    .action(async (options) => {
+    if (!options.apply) {
+        json({
+            camp: VERSION,
+            pins: { chatcrystal: "0.5.8", memorix: "1.3.1", "better-sqlite3": "12.11.1" },
+            applied: false,
+            detail: "All runtime dependencies are locked by the published npm-shrinkwrap.json.",
+        });
+        return;
+    }
+    // Stop the service manager first so it cannot race the old owner by
+    // immediately respawning it. Migrations and replacement binaries are
+    // touched only after the exact writer process releases its lock.
+    removeUserService(pathOwner());
+    await rpcCall("shutdown", {}, defaultRpcIdentity(), 5_000).catch(() => undefined);
+    await waitForDaemonExit();
+    const migration = await bootstrapAfterDaemonStop();
+    const service = installUserService(pathOwner(), true);
+    await ensureDaemon(service.active ? 30_000 : 5_000);
+    json({ camp: VERSION, applied: true, migration, service });
 });
 program
     .command("legacy-export")
@@ -402,67 +332,47 @@ program
     .action(async (options) => {
     if (!options.fromPima)
         throw new Error("legacy-export requires --from-pima");
-    const exported = await exportLegacyPima(options.output);
-    json({
-        source: exported.source,
-        output: exported.output,
-        database: exported.database,
-        counts: exported.counts,
-        files: exported.files.length,
-        manifest: exported.manifest,
-    });
+    json(await exportLegacyPima(options.output));
 });
 program
     .command("reindex")
     .description("Rebuild CAMP search indexes after an explicitly confirmed embedding-model change")
     .requiredOption("--embedding-digest <digest>", "Exact digest recorded in camp doctor --json")
-    .action((options) => {
-    const store = new CampStore();
-    try {
-        store.rebuildLexicalIndexes();
-        const manifest = acknowledgeEmbeddingReindex(options.embeddingDigest);
-        json({ rebuilt: true, modelManifest: manifest });
-    }
-    finally {
-        store.close();
-    }
+    .action(async (options) => {
+    await callDaemon("reindex");
+    json({ rebuilt: true, modelManifest: acknowledgeEmbeddingReindex(options.embeddingDigest) });
 });
-program
-    .command("mcp")
-    .description("Run the CAMP composite MCP server over stdio")
-    .action(async () => runMcpServer());
+program.command("mcp").description("Run the CAMP composite MCP server over stdio").action(async () => runMcpServer());
 program
     .command("daemon")
-    .description("Run continuous synchronization for registered projects")
+    .description("Run continuous synchronization and the authenticated local RPC service")
     .option("--interval <milliseconds>", "Polling interval", "60000")
     .action(async (options) => runDaemon(Math.max(5_000, Number(options.interval))));
 program
     .command("capture")
-    .description("Capture a host hook event without blocking the host")
+    .description("Capture a host hook event without opening the CAMP database")
     .requiredOption("--agent <agent>", "codex, claude, cursor, or antigravity")
     .requiredOption("--event <event>", "Native hook event name")
-    .action((options) => {
+    .action(async (options) => {
     const raw = readFileSync(0, "utf8").trim();
     let payload = {};
     if (raw) {
         try {
             const parsed = JSON.parse(raw);
-            if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            if (parsed && typeof parsed === "object" && !Array.isArray(parsed))
                 payload = parsed;
-            }
         }
         catch {
             process.stdout.write(JSON.stringify({ continue: true }));
             return;
         }
     }
-    const store = new CampStore();
-    try {
-        process.stdout.write(JSON.stringify(captureHook(store, parseAgent(options.agent), options.event, payload)));
-    }
-    finally {
-        store.close();
-    }
+    const source = parseAgent(options.agent);
+    const identity = defaultRpcIdentity("hook");
+    identity.name = `${source}-hook`;
+    identity.instanceId = String(payload.session_id ?? payload.sessionId ?? identity.instanceId);
+    const result = await callDaemon("capture", { agent: source, event: options.event, payload }, identity);
+    process.stdout.write(JSON.stringify(result));
 });
 program.parseAsync(process.argv).catch((error) => {
     process.stderr.write(`camp: ${error instanceof Error ? error.message : String(error)}\n`);

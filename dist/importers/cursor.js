@@ -19,19 +19,28 @@ function decodeFolder(value) {
         // Non-strict, drive-qualified records exist in older Cursor databases.
         decoded = decodeURIComponent(value.slice("file://".length));
     }
-    else {
+    else if (value.startsWith("file://")) {
         try {
-            decoded = value.startsWith("file://") ? fileURLToPath(value) : decodeURIComponent(value.replace(/^file:\/\/\//, "/"));
+            decoded = fileURLToPath(value);
         }
         catch {
             // Older Cursor records and test fixtures can contain `file://C:\\path`
             // rather than a strict file URI. Keep the drive path intact on Windows;
             // turning it into `/C:\\path` makes an exact workspace look unrelated.
-            const encoded = value.startsWith("file://") ? value.slice("file://".length) : value;
+            const encoded = value.slice("file://".length);
             decoded = decodeURIComponent(process.platform === "win32" && /^\/[A-Za-z]:[\\/]/.test(encoded)
                 ? encoded.slice(1)
                 : encoded);
         }
+    }
+    else if (/^(?:\/|[A-Za-z]:[\\/])/.test(value)) {
+        decoded = decodeURIComponent(value);
+    }
+    else {
+        // `vscode-remote://`, `untitled:`, and other URI schemes are not local
+        // filesystem identities. Resolving them against the daemon cwd can make a
+        // remote workspace look like a child of the registered project.
+        return null;
     }
     try {
         return realpathSync(decoded);
@@ -40,7 +49,7 @@ function decodeFolder(value) {
         return resolve(decoded);
     }
 }
-function scanWorkspaces(userDir) {
+function scanWorkspaces(userDir, project) {
     const storage = join(userDir, "workspaceStorage");
     if (!existsSync(storage))
         return [];
@@ -57,6 +66,17 @@ function scanWorkspaces(userDir) {
             const workspace = JSON.parse(readFileSync(workspaceJson, "utf8"));
             if (!workspace.folder)
                 continue;
+            const folder = decodeFolder(workspace.folder);
+            if (!folder)
+                continue;
+            // workspaceStorage can contain thousands of unrelated VS Code/Cursor
+            // databases. Resolve the tiny workspace.json first and never open an
+            // unrelated native database for this project scan.
+            if (project &&
+                !isInsidePath(folder, project.rootPath) &&
+                !isInsidePath(project.rootPath, folder)) {
+                continue;
+            }
             const db = openReadonly(database);
             try {
                 const row = db
@@ -68,7 +88,7 @@ function scanWorkspaces(userDir) {
                 if (!parsed.allComposers?.length)
                     continue;
                 result.push({
-                    folder: decodeFolder(workspace.folder),
+                    folder,
                     database,
                     composers: parsed.allComposers.map((composer) => ({
                         ...composer,
@@ -114,33 +134,31 @@ function scanGlobalComposerHeaders(db, globalDatabase, project) {
     if (!["composerId", "workspaceId", "value"].every((column) => columns.has(column))) {
         return [];
     }
-    const roots = new Set([project.rootPath, ...project.activePaths].map(canonicalPath));
-    const encodedRoot = encodeURI(project.rootPath);
-    // JSON-encoded Windows paths contain doubled backslashes in SQLite text.
-    // Search that representation too without broadening the project match.
-    const serializedRoot = JSON.stringify(project.rootPath).slice(1, -1);
-    let rows = db
+    const pathAliases = [...new Set([
+            project.rootPath,
+            ...project.activePaths,
+            ...project.aliases.filter((alias) => alias.kind === "path").map((alias) => alias.value),
+        ])];
+    const roots = new Set(pathAliases.map(canonicalPath));
+    // Search only textual variants of a registered path. A global fallback is
+    // unsafe: an old Cursor header can omit its workspace metadata, at which
+    // point treating the registered project as its workspace would leak another
+    // project's transcript into this archive.
+    const searchValues = [...new Set(pathAliases.flatMap((path) => [
+            path,
+            encodeURI(path),
+            // JSON-encoded Windows paths contain doubled backslashes in SQLite text.
+            JSON.stringify(path).slice(1, -1),
+        ]))];
+    const predicate = searchValues.map(() => "instr(value, ?) > 0").join(" OR ");
+    const rows = db
         .prepare(`
       SELECT composerId, workspaceId, createdAt, lastUpdatedAt, value
       FROM composerHeaders
-      WHERE instr(value, ?) > 0 OR instr(value, ?) > 0 OR instr(value, ?) > 0
+      WHERE ${predicate}
       ORDER BY lastUpdatedAt, composerId
     `)
-        .all(project.rootPath, encodedRoot, serializedRoot);
-    if (!rows.length) {
-        // A few Windows Cursor builds use a path serialization that SQLite's
-        // textual `instr` cannot match consistently. This bounded fallback still
-        // accepts only exact parsed repository identities below; it never widens
-        // retrieval to another project.
-        rows = db
-            .prepare(`
-        SELECT composerId, workspaceId, createdAt, lastUpdatedAt, value
-        FROM composerHeaders
-        ORDER BY lastUpdatedAt, composerId
-        LIMIT 10000
-      `)
-            .all();
-    }
+        .all(...searchValues);
     const workspaces = [];
     for (const row of rows) {
         try {
@@ -161,22 +179,27 @@ function scanGlobalComposerHeaders(db, globalDatabase, project) {
                 ? workspaceUri.fsPath
                 : typeof workspaceUri.path === "string"
                     ? workspaceUri.path
-                    : project.rootPath;
+                    : null;
+            const workspacePath = rawWorkspace ? decodeFolder(rawWorkspace) : null;
+            const exactWorkspace = workspacePath && roots.has(canonicalPath(workspacePath));
             // A header with an exact tracked repository and no siblings is strong
-            // evidence. Multi-repository parent-workspace composers require review.
-            // If old headers lack trackedGitRepos, the exact path match remains
-            // usable but bubble-level evidence is still required below.
+            // evidence. An exact workspace URI is also sufficient. Do not fabricate
+            // a workspace path when both fields are absent: that would convert a
+            // broad global-header scan into a cross-project import.
             const projectMatch = matching.length
                 ? otherProjectPaths.length
                     ? "ambiguous"
                     : "confident"
                 : undefined;
+            if (!projectMatch && !exactWorkspace)
+                continue;
             workspaces.push({
-                folder: decodeFolder(rawWorkspace),
+                folder: workspacePath ?? matching[0] ?? project.rootPath,
                 database: globalDatabase,
                 composers: [
                     {
                         composerId: row.composerId,
+                        headerFingerprint: stableId("cursor-composer-header-row@1", row.composerId, row.workspaceId ?? "", row.createdAt ?? "", row.lastUpdatedAt ?? "", row.value),
                         ...(row.createdAt !== null ? { createdAt: row.createdAt } : {}),
                         ...(row.lastUpdatedAt !== null ? { lastUpdatedAt: row.lastUpdatedAt } : {}),
                         ...(typeof head.name === "string" ? { name: head.name } : {}),
@@ -299,15 +322,31 @@ function bubbleMessages(rows, projectRoot) {
         attachments: [...attachments.values()],
     };
 }
-function cursorProjectDirectoryKeys(rootPath) {
-    const canonical = canonicalPath(rootPath);
-    const flattened = canonical.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
-    return new Set([
-        flattened,
-        encodeURIComponent(canonical),
-        encodeURI(canonical),
-        canonical.replaceAll("/", "-"),
-    ]);
+function cursorProjectDirectoryKeys(project) {
+    const paths = new Set();
+    for (const candidate of [
+        project.rootPath,
+        ...project.activePaths,
+        ...project.aliases.filter((alias) => alias.kind === "path").map((alias) => alias.value),
+    ]) {
+        // Cursor Agent CLI names its history directory from the workspace string
+        // that the user opened, rather than a resolved inode. Preserve that
+        // spelling alongside the canonical path so `/tmp` and symlinked workspaces
+        // remain one exact, project-scoped match.
+        paths.add(resolve(candidate));
+        paths.add(canonicalPath(candidate));
+    }
+    const keys = new Set();
+    for (const path of paths) {
+        keys.add(path.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, ""));
+        // Cursor Agent CLI also has releases that flatten dots and underscores,
+        // e.g. `/tmp/project.v1` becomes `tmp-project-v1`.
+        keys.add(path.replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-+|-+$/g, ""));
+        keys.add(encodeURIComponent(path));
+        keys.add(encodeURI(path));
+        keys.add(path.replaceAll("/", "-"));
+    }
+    return keys;
 }
 function cursorCliContent(value) {
     if (typeof value === "string")
@@ -317,6 +356,18 @@ function cursorCliContent(value) {
     const record = value;
     return record.content ?? record.text ?? record.message ?? record.parts ?? value;
 }
+function composerHeaderFingerprint(composer) {
+    if (composer.storageVersion === "global-composer-headers" &&
+        composer.headerFingerprint) {
+        return composer.headerFingerprint;
+    }
+    if (composer.storageVersion !== "global-composer-headers" ||
+        typeof composer.lastUpdatedAt !== "number" ||
+        !Number.isFinite(composer.lastUpdatedAt)) {
+        return null;
+    }
+    return stableId("cursor-composer-header@1", composer.composerId, composer.lastUpdatedAt, composer.storageVersion);
+}
 /**
  * Cursor Agent CLI writes a compact JSONL transcript under its project root.
  * The transcript currently omits timestamps in some versions, so the archive
@@ -324,10 +375,10 @@ function cursorCliContent(value) {
  * session fallback. A project directory must exactly encode the registered
  * root before it is imported automatically.
  */
-async function importCursorCli(store, project, summary, projectsRoot = process.env.CURSOR_PROJECTS_DIR ?? join(userHome(), ".cursor", "projects")) {
+async function importCursorCli(store, project, summary, projectsRoot = process.env.CURSOR_PROJECTS_DIR ?? join(userHome(), ".cursor", "projects"), cooperate = async () => undefined) {
     if (!existsSync(projectsRoot))
         return;
-    const keys = cursorProjectDirectoryKeys(project.rootPath);
+    const keys = cursorProjectDirectoryKeys(project);
     let directories = [];
     try {
         directories = readdirSync(projectsRoot, { withFileTypes: true })
@@ -341,49 +392,55 @@ async function importCursorCli(store, project, summary, projectsRoot = process.e
     for (const directory of directories) {
         const transcripts = await walkFiles(join(directory, "agent-transcripts"), [".jsonl"], 4);
         for (const path of transcripts) {
-            summary.scanned += 1;
-            const nativeId = `cursor-cli:${basename(path, ".jsonl")}`;
-            const fingerprint = fileFingerprint(path);
-            const checkpointKey = stableId(path, nativeId);
-            if (store.checkpoint(project.id, "cursor", checkpointKey) === fingerprint) {
-                summary.skipped += 1;
-                continue;
-            }
-            const messages = [];
-            await readJsonLines(path, (entry, sourceLine) => {
-                const rawMessage = entry.message ?? entry.payload ?? entry.content;
-                const item = message(messages.length, {
-                    id: typeof entry.id === "string" ? entry.id : `${nativeId}:${sourceLine}`,
-                    role: entry.role ?? entry.type,
-                    content: cursorCliContent(rawMessage),
-                    timestamp: entry.timestamp ?? entry.createdAt ?? entry.time,
-                    metadata: { sourceLine, transcriptFormat: "cursor-agent-jsonl@1" },
+            try {
+                summary.scanned += 1;
+                const nativeId = `cursor-cli:${basename(path, ".jsonl")}`;
+                const fingerprint = fileFingerprint(path);
+                const checkpointKey = stableId(path, nativeId);
+                if (store.checkpoint(project.id, "cursor", checkpointKey) === fingerprint) {
+                    summary.skipped += 1;
+                    continue;
+                }
+                const messages = [];
+                await readJsonLines(path, (entry, sourceLine) => {
+                    const rawMessage = entry.message ?? entry.payload ?? entry.content;
+                    const item = message(messages.length, {
+                        id: typeof entry.id === "string" ? entry.id : `${nativeId}:${sourceLine}`,
+                        role: entry.role ?? entry.type,
+                        content: cursorCliContent(rawMessage),
+                        timestamp: entry.timestamp ?? entry.createdAt ?? entry.time,
+                        metadata: { sourceLine, transcriptFormat: "cursor-agent-jsonl@1" },
+                    });
+                    if (item)
+                        messages.push(item);
+                }, cooperate);
+                if (!messages.length) {
+                    summary.errors.push(`Cursor CLI transcript contained no supported messages: ${path}`);
+                    store.setCheckpoint(project.id, "cursor", checkpointKey, fingerprint);
+                    continue;
+                }
+                const session = await canonicalSession({
+                    source: "cursor",
+                    surface: "cli",
+                    sourceVersion: "cursor-agent-transcript@1",
+                    nativeId,
+                    project,
+                    cwd: project.rootPath,
+                    sourcePath: path,
+                    messages,
+                    metadata: { projectDirectory: directory, projectEvidence: "exact-project-directory" },
                 });
-                if (item)
-                    messages.push(item);
-            });
-            if (!messages.length) {
-                summary.errors.push(`Cursor CLI transcript contained no supported messages: ${path}`);
-                continue;
+                const result = await store.storeSessionAsync(session, cooperate);
+                summary[result.status] += 1;
+                store.setCheckpoint(project.id, "cursor", checkpointKey, fingerprint);
             }
-            const session = await canonicalSession({
-                source: "cursor",
-                surface: "cli",
-                sourceVersion: "cursor-agent-transcript@1",
-                nativeId,
-                project,
-                cwd: project.rootPath,
-                sourcePath: path,
-                messages,
-                metadata: { projectDirectory: directory, projectEvidence: "exact-project-directory" },
-            });
-            const result = store.storeSession(session);
-            summary[result.status] += 1;
-            store.setCheckpoint(project.id, "cursor", checkpointKey, fingerprint);
+            finally {
+                await cooperate();
+            }
         }
     }
 }
-export async function importCursor(store, project, userDir = cursorUserDataDirectory()) {
+export async function importCursor(store, project, userDir = cursorUserDataDirectory(), cooperate = async () => undefined) {
     const summary = {
         source: "cursor",
         scanned: 0,
@@ -393,7 +450,7 @@ export async function importCursor(store, project, userDir = cursorUserDataDirec
         quarantined: 0,
         errors: [],
     };
-    await importCursorCli(store, project, summary);
+    await importCursorCli(store, project, summary, undefined, cooperate);
     const globalDatabase = join(userDir, "globalStorage", "state.vscdb");
     if (!existsSync(globalDatabase))
         return summary;
@@ -406,8 +463,7 @@ export async function importCursor(store, project, userDir = cursorUserDataDirec
         return summary;
     }
     try {
-        const legacyWorkspaces = scanWorkspaces(userDir).filter((workspace) => isInsidePath(workspace.folder, project.rootPath) ||
-            isInsidePath(project.rootPath, workspace.folder));
+        const legacyWorkspaces = scanWorkspaces(userDir, project);
         const modernWorkspaces = scanGlobalComposerHeaders(db, globalDatabase, project);
         const seenComposers = new Set();
         const workspaces = [...modernWorkspaces, ...legacyWorkspaces]
@@ -429,10 +485,26 @@ export async function importCursor(store, project, userDir = cursorUserDataDirec
             for (const composer of workspace.composers) {
                 summary.scanned += 1;
                 try {
+                    const checkpointKey = stableId(globalDatabase, composer.composerId);
+                    const headerFingerprint = composerHeaderFingerprint(composer);
+                    if (headerFingerprint &&
+                        store.checkpoint(project.id, "cursor", checkpointKey) === headerFingerprint) {
+                        summary.skipped += 1;
+                        continue;
+                    }
                     const rows = query.iterate(`bubbleId:${composer.composerId}:%`);
                     const parsed = bubbleMessages(rows, project.rootPath);
                     if (!parsed.messages.length)
                         continue;
+                    const contentFingerprint = headerFingerprint ?? parsed.sourceHash;
+                    // Older composer headers do not always carry lastUpdatedAt. Their
+                    // bubble hash is still a stable checkpoint, and it must be checked
+                    // before quarantine handling so an unchanged ambiguous composer is
+                    // not reparsed and re-quarantined on every poll.
+                    if (store.checkpoint(project.id, "cursor", checkpointKey) === contentFingerprint) {
+                        summary.skipped += 1;
+                        continue;
+                    }
                     const assigned = store.isSourceAssigned("cursor", globalDatabase, composer.composerId, project.id);
                     if (composer.projectMatch === "ambiguous" && !assigned) {
                         store.addQuarantine({
@@ -448,25 +520,28 @@ export async function importCursor(store, project, userDir = cursorUserDataDirec
                                 messages: parsed.messages.length,
                             },
                         });
+                        store.setCheckpoint(project.id, "cursor", checkpointKey, contentFingerprint);
                         summary.quarantined += 1;
                         continue;
                     }
                     if (!exactWorkspace &&
-                        composer.projectMatch !== "confident" &&
-                        !parsed.directProjectEvidence &&
-                        !assigned) {
+                        !assigned &&
+                        (composer.storageVersion === "workspace-composer-data" ||
+                            composer.projectMatch !== "confident")) {
                         store.addQuarantine({
                             projectId: project.id,
                             source: "cursor",
                             sourcePath: globalDatabase,
                             nativeId: composer.composerId,
-                            reason: "Cursor conversation belongs to a parent workspace and contains no exclusive project-path evidence",
+                            reason: "Cursor conversation belongs to a parent workspace; explicit project assignment is required",
                             metadata: {
                                 workspace: workspace.folder,
                                 name: composer.name ?? null,
+                                directProjectEvidence: parsed.directProjectEvidence,
                                 messages: parsed.messages.length,
                             },
                         });
+                        store.setCheckpoint(project.id, "cursor", checkpointKey, contentFingerprint);
                         summary.quarantined += 1;
                         continue;
                     }
@@ -479,12 +554,8 @@ export async function importCursor(store, project, userDir = cursorUserDataDirec
                             reason: `Unknown Cursor bubble schema: ${parsed.unknownSchemas.join(", ")}`,
                             metadata: { workspace: workspace.folder },
                         });
+                        store.setCheckpoint(project.id, "cursor", checkpointKey, contentFingerprint);
                         summary.quarantined += 1;
-                        continue;
-                    }
-                    const checkpointKey = stableId(globalDatabase, composer.composerId);
-                    if (store.checkpoint(project.id, "cursor", checkpointKey) === parsed.sourceHash) {
-                        summary.skipped += 1;
                         continue;
                     }
                     const session = await canonicalSession({
@@ -505,12 +576,15 @@ export async function importCursor(store, project, userDir = cursorUserDataDirec
                             storageVersion: composer.storageVersion ?? "workspace-composer-data",
                         },
                     });
-                    const result = store.storeSession(session);
+                    const result = await store.storeSessionAsync(session, cooperate);
                     summary[result.status] += 1;
-                    store.setCheckpoint(project.id, "cursor", checkpointKey, parsed.sourceHash);
+                    store.setCheckpoint(project.id, "cursor", checkpointKey, contentFingerprint);
                 }
                 catch (error) {
                     summary.errors.push(`${composer.composerId}: ${error instanceof Error ? error.message : String(error)}`);
+                }
+                finally {
+                    await cooperate();
                 }
             }
         }

@@ -1,5 +1,4 @@
-import { spawn } from "node:child_process";
-import { appendFileSync, chmodSync, existsSync } from "node:fs";
+import { appendFileSync, chmodSync } from "node:fs";
 import { join } from "node:path";
 import { ensurePrivateDirectory, getCampPaths } from "./paths.js";
 import { resolveProject } from "./registry.js";
@@ -17,7 +16,7 @@ function firstString(...values) {
     }
     return null;
 }
-function projectForPayload(store, payload) {
+export function projectForHookPayload(store, payload) {
     const workspacePaths = Array.isArray(payload.workspacePaths) ? payload.workspacePaths : [];
     const roots = Array.isArray(payload.workspace_roots) ? payload.workspace_roots : [];
     const candidates = [
@@ -101,29 +100,17 @@ function hookOutput(agent, event, handoffContext, taskContext) {
     }
     return { continue: true };
 }
-function triggerFastSync(store, project, agent, sessionId, event) {
-    if (!project || !/SessionStart|PreInvocation/i.test(event))
+function triggerFastSync(store, project, agent, sessionId, event, requestFastSync) {
+    if (!project || !/SessionStart|PreInvocation|PostInvocation|Stop/i.test(event))
         return;
     const key = `fast-sync:${sessionId ?? event}`;
     if (store.checkpoint(project.id, agent, key))
         return;
     store.setCheckpoint(project.id, agent, key, nowIso());
-    const cliPath = process.argv[1];
-    if (!cliPath || !existsSync(cliPath) || !/cli\.(?:js|ts)$/.test(cliPath))
-        return;
-    const args = cliPath.endsWith(".ts")
-        ? ["--import", "tsx", cliPath, "sync", project.id, "--once"]
-        : [cliPath, "sync", project.id, "--once"];
-    const child = spawn(process.execPath, args, {
-        cwd: project.rootPath,
-        detached: true,
-        env: process.env,
-        stdio: "ignore",
-    });
-    child.unref();
+    requestFastSync?.(project.id);
 }
-export function captureHook(store, agent, event, payload) {
-    const project = projectForPayload(store, payload);
+export function captureHook(store, agent, event, payload, requestFastSync) {
+    const project = projectForHookPayload(store, payload);
     const sessionId = firstString(payload.conversationId, payload.conversation_id, payload.session_id, payload.sessionId);
     const paths = getCampPaths();
     ensurePrivateDirectory(paths.spoolDir);
@@ -144,7 +131,7 @@ export function captureHook(store, agent, event, payload) {
     catch {
         // Best effort on non-POSIX filesystems.
     }
-    triggerFastSync(store, project, agent, sessionId, event);
+    triggerFastSync(store, project, agent, sessionId, event, requestFastSync);
     const taskContext = /^(?:UserPromptSubmit|PreInvocation)$/.test(event)
         ? firstTaskContext(store, project, agent, sessionId, payload)
         : null;

@@ -7,8 +7,10 @@ interface ChatCrystalResult {
     skipped: number;
     errors: number;
     errorIds: string[];
+    items: Array<Record<string, unknown>>;
 }
-export declare function syncChatCrystal(store: CampStore, project: ProjectRegistration): Promise<ChatCrystalResult>;
+export declare const CHATCRYSTAL_BASELINE = "0.5.8";
+export declare function syncChatCrystal(store: CampStore, project: ProjectRegistration, cooperate?: () => Promise<void>): Promise<ChatCrystalResult>;
 export declare function purgeChatCrystalProject(store: CampStore, project: ProjectRegistration): Promise<{
     deleted: number;
 }>;

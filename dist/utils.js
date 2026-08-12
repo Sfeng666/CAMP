@@ -83,4 +83,27 @@ export function truncateByApproxTokens(text, maxTokens) {
         return text;
     return `${text.slice(0, Math.max(0, maxChars - 24)).trimEnd()}\n[truncated by CAMP]`;
 }
+/**
+ * Await slow local inference or a child backend without monopolizing the
+ * daemon's mutation FIFO. The operation keeps running, but authenticated work
+ * that was already queued can complete at each bounded pulse.
+ */
+export async function cooperativeAwait(operation, cooperate, intervalMs = 250) {
+    const settled = operation.then((value) => ({ ok: true, value }), (error) => ({ ok: false, error }));
+    while (true) {
+        let timer = null;
+        const pulse = new Promise((resolvePulse) => {
+            timer = setTimeout(() => resolvePulse(null), Math.max(25, intervalMs));
+        });
+        const outcome = await Promise.race([settled, pulse]);
+        if (outcome) {
+            if (timer)
+                clearTimeout(timer);
+            if (outcome.ok)
+                return outcome.value;
+            throw outcome.error;
+        }
+        await cooperate();
+    }
+}
 //# sourceMappingURL=utils.js.map

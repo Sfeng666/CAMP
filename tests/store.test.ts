@@ -6,7 +6,7 @@ import { isolatedCamp, type IsolatedCamp } from "./helpers.js";
 import { CampStore } from "../src/store.js";
 import { setupProject } from "../src/registry.js";
 import { SCHEMA_VERSION, type CanonicalSession } from "../src/types.js";
-import { truncateByApproxTokens } from "../src/utils.js";
+import { stableId, truncateByApproxTokens } from "../src/utils.js";
 import {
   archiveMemorixProjectRecords,
   finalizeMemorixMigration,
@@ -54,6 +54,21 @@ describe("project registry and stores", () => {
     expect(gitProject.migrationState).toBe("pending-memorix");
   });
 
+  it("marks a daemon-interrupted source scan degraded before accepting new work", () => {
+    const root = join(env.root, "interrupted-sync");
+    mkdirSync(root);
+    const project = setupProject(store, root);
+    store.beginSourceSync(project.id, "cursor");
+    expect(store.projectSyncInProgress(project.id)).toBe(true);
+    expect(store.recoverInterruptedSyncs()).toBe(1);
+    expect(store.projectSyncInProgress(project.id)).toBe(false);
+    expect(store.sourceFreshness(project.id)[0]).toMatchObject({
+      source: "cursor",
+      status: "degraded",
+      error: { phase: "recovery" },
+    });
+  });
+
   it("reconciles a Git worktree and a non-origin remote with the same project", () => {
     const root = join(env.root, "git-project");
     const worktree = join(env.root, "git-worktree");
@@ -83,7 +98,7 @@ describe("project registry and stores", () => {
     expect(secondary.activePaths).toEqual(expect.arrayContaining([primary.rootPath, secondary.rootPath]));
   });
 
-  it("deletes only exactly matched CAMP Memorix records through an idempotent purge", () => {
+  it("deletes only exactly matched CAMP Memorix records through an idempotent purge", async () => {
     const root = join(env.root, "memorix-purge-project");
     mkdirSync(root);
     expect(spawnSync("git", ["init", "-q", root]).status).toBe(0);
@@ -103,7 +118,7 @@ describe("project registry and stores", () => {
       worktreeFingerprint: null,
     });
     queueMemorix(store, project, record);
-    expect(flushMemorix(store, project)).toMatchObject({ completed: 1, failed: 0 });
+    expect(await flushMemorix(store, project)).toMatchObject({ completed: 1, failed: 0 });
 
     expect(archiveMemorixProjectRecords(store, project)).toMatchObject({
       deleted: 1,
@@ -117,6 +132,69 @@ describe("project registry and stores", () => {
       unavailable: false,
       errors: [],
     });
+  });
+
+  it("writes the pinned Memorix observation contract without leaking quarantined evidence", async () => {
+    const root = join(env.root, "memorix-contract-project");
+    mkdirSync(root);
+    expect(spawnSync("git", ["init", "-q", root]).status).toBe(0);
+    const project = setupProject(store, root);
+    const record = store.putEvidence({
+      projectId: project.id,
+      kind: "decision",
+      state: "verified",
+      title: "Compatible curated observation",
+      content: "CAMP preserves the Memorix 1.3.1 observation contract.",
+      confidence: 1,
+      sourceAgent: "camp",
+      sourceSessionId: null,
+      sourceUri: "camp://contract-test",
+      relevantFiles: ["README.md"],
+      commit: null,
+      worktreeFingerprint: null,
+    });
+    queueMemorix(store, project, record);
+    expect(await flushMemorix(store, project)).toMatchObject({
+      completed: 1,
+      failed: 0,
+      unavailable: false,
+    });
+
+    const cli = join(process.cwd(), "node_modules", "memorix", "dist", "cli", "index.js");
+    const recent = spawnSync(
+      process.execPath,
+      [cli, "memory", "recent", "--limit", "10", "--json", "--cwd", root],
+      {
+        cwd: root,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          MEMORIX_DATA_DIR: join(store.paths.backendDir, "memorix"),
+          MEMORIX_AUTO_UPDATE: "off",
+        },
+        timeout: 30_000,
+      },
+    );
+    expect(recent.status, recent.stderr).toBe(0);
+    expect(recent.stdout).toContain(record.title);
+
+    const quarantined = store.putEvidence({
+      projectId: project.id,
+      kind: "verification",
+      state: "quarantined",
+      title: "Isolated canary",
+      content: "This payload must not enter ordinary Memorix recall.",
+      confidence: 1,
+      sourceAgent: "cursor",
+      sourceSessionId: "canary-session",
+      sourceUri: "camp://verification/quarantined",
+      relevantFiles: [],
+      commit: null,
+      worktreeFingerprint: null,
+    });
+    const pendingBefore = store.pendingOutbox("memorix").length;
+    queueMemorix(store, project, quarantined);
+    expect(store.pendingOutbox("memorix")).toHaveLength(pendingBefore);
   });
 
   it("preserves the first changed path from porcelain status exactly", () => {
@@ -175,6 +253,81 @@ describe("project registry and stores", () => {
     mkdirSync(otherRoot);
     const other = setupProject(store, otherRoot);
     expect(store.search(other.id, "humane recipient first name", "all")).toEqual([]);
+  });
+
+  it("appends a growing transcript without duplicating prior messages", async () => {
+    const root = join(env.root, "growing-workspace");
+    mkdirSync(root);
+    const project = setupProject(store, root);
+    const sourcePath = join(root, "growing.jsonl");
+    writeFileSync(sourcePath, "{}\n");
+    const base: CanonicalSession = {
+      schemaVersion: SCHEMA_VERSION,
+      source: "codex",
+      surface: "cli",
+      nativeId: "growing-session",
+      projectId: project.id,
+      projectRoot: project.rootPath,
+      cwd: project.rootPath,
+      sourcePath,
+      sourceFingerprint: "extent-1",
+      startedAt: "2026-01-01T00:00:00.000Z",
+      endedAt: "2026-01-01T00:01:00.000Z",
+      messages: [
+        {
+          id: "one",
+          sequence: 0,
+          role: "user",
+          kind: "message",
+          content: "First stable message OLDPREFIXONLY",
+          timestamp: "2026-01-01T00:00:00.000Z",
+          metadata: { sourceLine: 1 },
+        },
+        {
+          id: "two",
+          sequence: 1,
+          role: "assistant",
+          kind: "message",
+          content: "Second stable message",
+          timestamp: "2026-01-01T00:01:00.000Z",
+          metadata: { sourceLine: 2 },
+        },
+      ],
+    };
+    expect(store.storeSession(base).status).toBe("imported");
+    const grown: CanonicalSession = {
+      ...base,
+      sourceFingerprint: "extent-2",
+      endedAt: "2026-01-01T00:02:00.000Z",
+      messages: [
+        ...base.messages,
+        {
+          id: "three",
+          sequence: 2,
+          role: "assistant",
+          kind: "message",
+          content: "Third appended message",
+          timestamp: "2026-01-01T00:02:00.000Z",
+          metadata: { sourceLine: 3 },
+        },
+      ],
+    };
+    expect(await store.storeSessionAsync(grown)).toMatchObject({ status: "replaced" });
+    expect(store.getSession(stableId(project.id, "codex", base.nativeId), project.id)?.messages).toHaveLength(3);
+    expect(await store.storeSessionAsync(grown)).toMatchObject({ status: "skipped" });
+    expect(store.projectStatus(project.id).messages).toBe(3);
+
+    const rewritten: CanonicalSession = {
+      ...grown,
+      sourceFingerprint: "extent-3",
+      messages: grown.messages.map((item, index) =>
+        index === 0 ? { ...item, content: "First safely rewritten message NEWPREFIXONLY" } : item,
+      ),
+    };
+    expect(await store.storeSessionAsync(rewritten)).toMatchObject({ status: "replaced" });
+    expect(store.projectStatus(project.id).messages).toBe(3);
+    expect(store.search(project.id, "NEWPREFIXONLY", "raw")).toHaveLength(1);
+    expect(store.search(project.id, "OLDPREFIXONLY", "raw")).toHaveLength(0);
   });
 
   it("rejects secrets from curated memory, redacts raw recall, and bounds handoffs", () => {

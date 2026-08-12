@@ -5,6 +5,6 @@ interface ParsedCodex {
     cwd: string | null;
     messages: CanonicalMessage[];
 }
-export declare function parseCodexFile(path: string): Promise<ParsedCodex>;
-export declare function importCodex(store: CampStore, project: ProjectRegistration, root?: string): Promise<ImportSummary>;
+export declare function parseCodexFile(path: string, cooperate?: () => Promise<void>): Promise<ParsedCodex>;
+export declare function importCodex(store: CampStore, project: ProjectRegistration, root?: string, cooperate?: () => Promise<void>): Promise<ImportSummary>;
 export {};

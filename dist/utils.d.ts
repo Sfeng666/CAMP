@@ -8,3 +8,9 @@ export declare function readJsonFile<T>(path: string, fallback: T): T;
 export declare function fileFingerprint(path: string): string;
 export declare function toStringContent(value: unknown): string;
 export declare function truncateByApproxTokens(text: string, maxTokens: number): string;
+/**
+ * Await slow local inference or a child backend without monopolizing the
+ * daemon's mutation FIFO. The operation keeps running, but authenticated work
+ * that was already queued can complete at each bounded pulse.
+ */
+export declare function cooperativeAwait<T>(operation: Promise<T>, cooperate: () => Promise<void>, intervalMs?: number): Promise<T>;

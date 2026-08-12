@@ -1,121 +1,137 @@
-import { createRequire } from "node:module";
-import { dirname, join } from "node:path";
-import { pathToFileURL } from "node:url";
-import { basename } from "node:path";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { ensurePrivateDirectory, ensurePrivateFile } from "../paths.js";
-function mappedSource(source) {
-    if (source === "claude")
-        return "claude-code";
-    if (source === "cursor")
-        return "cursor";
-    if (source === "antigravity")
-        return "antigravity";
-    return "codex";
-}
-function conversationItem(session, project, sourceInfo, buildRemoteImportItem) {
-    if (session.messages.length < 2)
-        return null;
-    const source = mappedSource(session.source);
-    const nativeId = `${project.id}:${session.source}:${session.nativeId}`;
-    const parsedMessages = session.messages.map((item) => ({
-        id: item.id,
-        parentUuid: item.parentId ?? null,
-        type: item.role === "user"
-            ? "user"
-            : item.role === "assistant"
-                ? "assistant"
-                : "system",
-        role: item.role,
-        content: item.content,
-        hasToolUse: item.kind === "tool-call" || item.kind === "tool-result",
-        hasCode: item.content.includes("```"),
-        thinking: null,
-        timestamp: item.timestamp,
-    }));
-    const parsed = {
-        id: nativeId,
-        slug: session.messages.find((item) => item.role === "user")?.content.slice(0, 100) ?? null,
-        source,
-        projectDir: project.rootPath,
-        projectName: basename(project.rootPath),
-        cwd: session.cwd,
-        gitBranch: null,
-        messages: parsedMessages,
-        firstMessageAt: session.startedAt,
-        lastMessageAt: session.endedAt,
-    };
-    const meta = {
-        id: nativeId,
-        source,
-        filePath: session.sourcePath,
-        fileSize: sourceInfo.size,
-        fileMtime: sourceInfo.mtime,
-        projectDir: project.rootPath,
-    };
-    return buildRemoteImportItem(source, meta, parsed, `camp-${session.source}@1`);
-}
-export async function syncChatCrystal(store, project) {
-    const dataDir = join(store.paths.backendDir, "chatcrystal");
-    ensurePrivateDirectory(dataDir);
-    process.env.DATA_DIR = dataDir;
-    const require = createRequire(import.meta.url);
-    const packageRoot = dirname(require.resolve("chatcrystal/package.json"));
-    const payloadModule = (await import(pathToFileURL(join(packageRoot, "dist", "server", "src", "services", "importPayload.js")).href));
-    if (!payloadModule.SUPPORTED_IMPORT_SOURCES.includes("antigravity")) {
-        // Pinned ChatCrystal 0.5.8 exposes this mutable runtime enum. CAMP extends
-        // it narrowly before normalized ingest; no native ChatCrystal watcher is
-        // enabled and CAMP's canonical source remains authoritative.
-        payloadModule.SUPPORTED_IMPORT_SOURCES.push("antigravity");
+import { nowIso } from "../utils.js";
+import { redactForRecall } from "../redaction.js";
+import { cooperativeAwait } from "../utils.js";
+export const CHATCRYSTAL_BASELINE = "0.5.8";
+const emptyResult = () => ({
+    total: 0,
+    imported: 0,
+    replaced: 0,
+    skipped: 0,
+    errors: 0,
+    errorIds: [],
+    items: [],
+});
+function workerInvocation(mode, projectId) {
+    const current = fileURLToPath(import.meta.url);
+    if (current.endsWith(".ts")) {
+        const loader = fileURLToPath(new URL("../../node_modules/tsx/dist/loader.mjs", import.meta.url));
+        const worker = fileURLToPath(new URL("./chatcrystal-worker.ts", import.meta.url));
+        return {
+            command: process.execPath,
+            args: ["--import", loader, worker, mode, ...(projectId ? [projectId] : [])],
+        };
     }
-    const ingestModule = (await import(pathToFileURL(join(packageRoot, "dist", "server", "src", "services", "ingest.js")).href));
-    const databaseModule = (await import(pathToFileURL(join(packageRoot, "dist", "server", "src", "db", "index.js")).href));
-    // ChatCrystal logs database initialization to stdout. CAMP's MCP transport
-    // and --json CLI output both require stdout to remain protocol-clean.
-    const originalLog = console.log;
+    const worker = fileURLToPath(new URL("./chatcrystal-worker.js", import.meta.url));
+    return { command: process.execPath, args: [worker, mode, ...(projectId ? [projectId] : [])] };
+}
+async function runWorker(input) {
+    const invocation = workerInvocation(input.mode, input.projectId);
+    const child = spawn(invocation.command, invocation.args, {
+        env: { ...process.env, DATA_DIR: input.dataDir, CAMP_CHATCRYSTAL_WORKER: "1" },
+        stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    let streamError = null;
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+        stdout += chunk;
+        if (stdout.length > 2 * 1024 * 1024)
+            child.kill("SIGTERM");
+    });
+    child.stderr.on("data", (chunk) => {
+        if (stderr.length < 64 * 1024)
+            stderr += chunk;
+    });
+    child.stdin.on("error", (error) => {
+        streamError = error;
+    });
+    const completed = new Promise((resolve, reject) => {
+        child.once("error", reject);
+        child.once("close", resolve);
+    });
+    const timer = setTimeout(() => child.kill("SIGTERM"), 10 * 60_000);
     try {
-        console.log = () => undefined;
-        await databaseModule.initDatabase();
+        if (input.records) {
+            for await (const line of input.records) {
+                if (!child.stdin.write(`${line}\n`)) {
+                    await Promise.race([
+                        once(child.stdin, "drain"),
+                        completed.then(() => {
+                            throw streamError ?? new Error("ChatCrystal worker closed its input early");
+                        }),
+                    ]);
+                }
+            }
+        }
+        child.stdin.end();
+        const status = await completed;
+        if (streamError)
+            throw streamError;
+        if (status !== 0) {
+            throw new Error(redactForRecall(stderr.trim() || `ChatCrystal worker exited ${status}`).slice(0, 64 * 1024));
+        }
+        return JSON.parse(stdout);
     }
     finally {
-        console.log = originalLog;
+        clearTimeout(timer);
+        if (!child.killed && child.exitCode === null)
+            child.kill("SIGTERM");
     }
-    const items = [];
-    for (const id of store.listSessionIds(project.id)) {
-        const session = store.getSession(id, project.id);
-        if (!session)
-            continue;
-        const item = conversationItem(session, project, store.sourceFileInfo(session.sourcePath), payloadModule.buildRemoteImportItem);
-        if (item)
-            items.push(item);
-    }
-    if (!items.length) {
+}
+export async function syncChatCrystal(store, project, cooperate = async () => undefined) {
+    const dataDir = join(store.paths.backendDir, "chatcrystal");
+    ensurePrivateDirectory(dataDir);
+    const checkpointKey = "chatcrystal:last-success";
+    const checkpoint = store.checkpoint(project.id, "archive", checkpointKey);
+    const ids = store.listSessionIdsSince(project.id, checkpoint || null);
+    if (!ids.length) {
+        store.setCheckpoint(project.id, "archive", checkpointKey, nowIso());
         ensurePrivateFile(join(dataDir, "chatcrystal.db"));
-        return { total: 0, imported: 0, replaced: 0, skipped: 0, errors: 0, errorIds: [] };
+        return emptyResult();
     }
-    const result = ingestModule.ingestRemoteImport({ version: 1, items });
+    async function* records() {
+        for (const id of ids) {
+            const archive = store.sessionArchiveInfo(id, project.id);
+            if (!archive || archive.messageCount < 2 || !existsSync(archive.archivePath))
+                continue;
+            yield JSON.stringify({
+                archivePath: archive.archivePath,
+                project,
+                sourceInfo: store.sourceFileInfo(archive.sourcePath),
+            });
+            // The worker reads and decompresses the content-addressed archive. The
+            // daemon sends only this small descriptor and remains responsive even
+            // when one conversation contains tens of megabytes of tool output.
+            await cooperate();
+        }
+    }
+    const result = (await cooperativeAwait(runWorker({ mode: "ingest", dataDir, records: records() }), cooperate));
+    if (!result.errors)
+        store.setCheckpoint(project.id, "archive", checkpointKey, nowIso());
     ensurePrivateFile(join(dataDir, "chatcrystal.db"));
     return result;
 }
 export async function purgeChatCrystalProject(store, project) {
     const dataDir = join(store.paths.backendDir, "chatcrystal");
     ensurePrivateDirectory(dataDir);
-    process.env.DATA_DIR = dataDir;
-    const require = createRequire(import.meta.url);
-    const packageRoot = dirname(require.resolve("chatcrystal/package.json"));
-    const databaseModule = (await import(pathToFileURL(join(packageRoot, "dist", "server", "src", "db", "index.js")).href));
-    const originalLog = console.log;
-    try {
-        console.log = () => undefined;
-        await databaseModule.initDatabase();
-    }
-    finally {
-        console.log = originalLog;
-    }
-    const db = databaseModule.getDatabase();
-    db.run("DELETE FROM conversations WHERE source_conversation_id LIKE ?", [`${project.id}:%`]);
-    const deleted = db.getRowsModified();
-    databaseModule.saveDatabase();
+    if (!existsSync(join(dataDir, "chatcrystal.db")))
+        return { deleted: 0 };
+    const result = (await runWorker({
+        mode: "purge",
+        dataDir,
+        projectId: project.id,
+    }));
+    // A later re-registration can safely repopulate only this exact project.
+    store.setCheckpoint(project.id, "archive", "chatcrystal:last-success", "");
     ensurePrivateFile(join(dataDir, "chatcrystal.db"));
-    return { deleted };
+    return result;
 }
 //# sourceMappingURL=chatcrystal.js.map

@@ -2,7 +2,28 @@ import { existsSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { fileFingerprint, stableId } from "../utils.js";
 import { userHome } from "../platform.js";
-import { canonicalSession, message, projectMatch, readJsonLines, walkFiles, } from "./common.js";
+import { canonicalSession, message, projectMatch, readJsonLinePrefix, readJsonLines, walkFiles, } from "./common.js";
+async function parseCodexMetadata(path) {
+    let nativeId = basename(path, ".jsonl");
+    let cwd = null;
+    for (const { value: entry } of await readJsonLinePrefix(path)) {
+        const payload = (entry.payload && typeof entry.payload === "object"
+            ? entry.payload
+            : {});
+        if (entry.type === "session_meta") {
+            if (typeof payload.id === "string")
+                nativeId = payload.id;
+            if (typeof payload.cwd === "string")
+                cwd = payload.cwd;
+        }
+        else if (entry.type === "turn_context" && typeof payload.cwd === "string") {
+            cwd = payload.cwd;
+        }
+        if (cwd && nativeId !== basename(path, ".jsonl"))
+            break;
+    }
+    return { nativeId, cwd };
+}
 function extractCodexMessage(entry, sequence, sourceLine) {
     const payload = (entry.payload && typeof entry.payload === "object"
         ? entry.payload
@@ -52,7 +73,7 @@ function extractCodexMessage(entry, sequence, sourceLine) {
     }
     return null;
 }
-export async function parseCodexFile(path) {
+export async function parseCodexFile(path, cooperate = async () => undefined) {
     let nativeId = basename(path, ".jsonl");
     let cwd = null;
     const messages = [];
@@ -74,10 +95,10 @@ export async function parseCodexFile(path) {
         const extracted = extractCodexMessage(entry, messages.length, sourceLine);
         if (extracted)
             messages.push(extracted);
-    });
+    }, cooperate);
     return { nativeId, cwd, messages };
 }
-async function importCodexSummary(store, project, summary) {
+async function importCodexSummary(store, project, summary, cooperate = async () => undefined) {
     const candidates = [
         resolve(project.rootPath, "codex_summary", "chat_history", "project_chat_history.jsonl"),
         resolve(project.rootPath, "codex_summary", "project_chat_history.jsonl"),
@@ -86,6 +107,12 @@ async function importCodexSummary(store, project, summary) {
         if (!existsSync(path))
             continue;
         summary.scanned += 1;
+        const checkpointKey = stableId("codex-summary", path);
+        const fingerprint = fileFingerprint(path);
+        if (store.checkpoint(project.id, "archive", checkpointKey) === fingerprint) {
+            summary.skipped += 1;
+            continue;
+        }
         const grouped = new Map();
         await readJsonLines(path, (entry, line) => {
             const sessionId = String(entry.session_id ?? entry.sessionId ?? entry.conversation_id ?? "project-chat-archive");
@@ -104,7 +131,7 @@ async function importCodexSummary(store, project, summary) {
             if (item)
                 list.push(item);
             grouped.set(sessionId, list);
-        });
+        }, cooperate);
         for (const [nativeId, messages] of grouped) {
             if (!messages.length)
                 continue;
@@ -119,12 +146,13 @@ async function importCodexSummary(store, project, summary) {
                 messages,
                 metadata: { source: "codex_summary" },
             });
-            const result = store.storeSession(session);
+            const result = await store.storeSessionAsync(session, cooperate);
             summary[result.status] += 1;
         }
+        store.setCheckpoint(project.id, "archive", checkpointKey, fingerprint);
     }
 }
-export async function importCodex(store, project, root = process.env.CODEX_SESSIONS_DIR ?? join(userHome(), ".codex", "sessions")) {
+export async function importCodex(store, project, root = process.env.CODEX_SESSIONS_DIR ?? join(userHome(), ".codex", "sessions"), cooperate = async () => undefined) {
     const summary = {
         source: "codex",
         scanned: 0,
@@ -144,10 +172,35 @@ export async function importCodex(store, project, root = process.env.CODEX_SESSI
                 summary.skipped += 1;
                 continue;
             }
-            const parsed = await parseCodexFile(path);
-            const match = projectMatch(parsed.cwd, project);
-            if (match === "unrelated")
+            const metadata = await parseCodexMetadata(path);
+            const preflightMatch = projectMatch(metadata.cwd, project);
+            if (preflightMatch === "unrelated") {
+                store.setCheckpoint(project.id, "codex", checkpointKey, fingerprint);
                 continue;
+            }
+            const preflightAssigned = store.isSourceAssigned("codex", path, metadata.nativeId, project.id);
+            if (preflightMatch === "parent" && !preflightAssigned) {
+                store.addQuarantine({
+                    projectId: project.id,
+                    source: "codex",
+                    sourcePath: path,
+                    nativeId: metadata.nativeId,
+                    reason: "Codex session is attached to a parent workspace; explicit project assignment is required",
+                    metadata: { cwd: metadata.cwd, preflightOnly: true },
+                });
+                store.setCheckpoint(project.id, "codex", checkpointKey, fingerprint);
+                summary.quarantined += 1;
+                continue;
+            }
+            const parsed = await parseCodexFile(path, cooperate);
+            const match = projectMatch(parsed.cwd, project);
+            if (match === "unrelated") {
+                // Remember negative project attribution too. Without this checkpoint,
+                // every registered project reparses every unrelated historical JSONL
+                // on every poll.
+                store.setCheckpoint(project.id, "codex", checkpointKey, fingerprint);
+                continue;
+            }
             const assigned = store.isSourceAssigned("codex", path, parsed.nativeId, project.id);
             if (match !== "exact" && !assigned) {
                 if (match === "parent" && parsed.messages.length) {
@@ -159,12 +212,20 @@ export async function importCodex(store, project, root = process.env.CODEX_SESSI
                         reason: "Codex session is attached to a parent workspace; explicit project assignment is required",
                         metadata: { cwd: parsed.cwd, messages: parsed.messages.length },
                     });
+                    store.setCheckpoint(project.id, "codex", checkpointKey, fingerprint);
                     summary.quarantined += 1;
+                }
+                if (match === "unknown") {
+                    // An unchanged file cannot acquire workspace evidence; appending
+                    // later changes its fingerprint and causes a safe retry.
+                    store.setCheckpoint(project.id, "codex", checkpointKey, fingerprint);
                 }
                 continue;
             }
-            if (!parsed.messages.length)
+            if (!parsed.messages.length) {
+                store.setCheckpoint(project.id, "codex", checkpointKey, fingerprint);
                 continue;
+            }
             const session = await canonicalSession({
                 source: "codex",
                 surface: "cli",
@@ -175,15 +236,19 @@ export async function importCodex(store, project, root = process.env.CODEX_SESSI
                 sourcePath: path,
                 messages: parsed.messages,
             });
-            const result = store.storeSession(session);
+            const result = await store.storeSessionAsync(session, cooperate);
             summary[result.status] += 1;
             store.setCheckpoint(project.id, "codex", checkpointKey, fingerprint);
         }
         catch (error) {
             summary.errors.push(`${path}: ${error instanceof Error ? error.message : String(error)}`);
         }
+        finally {
+            await cooperate();
+        }
     }
-    await importCodexSummary(store, project, summary);
+    await importCodexSummary(store, project, summary, cooperate);
+    await cooperate();
     return summary;
 }
 //# sourceMappingURL=codex.js.map

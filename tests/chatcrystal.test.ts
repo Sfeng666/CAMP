@@ -1,5 +1,6 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { isolatedCamp, type IsolatedCamp } from "./helpers.js";
 import { CampStore } from "../src/store.js";
@@ -66,7 +67,19 @@ describe("ChatCrystal normalized ingest extension", () => {
     expect((first as unknown as { items: Array<{ source: string }> }).items[0]?.source).toBe(
       "antigravity",
     );
-    expect(second.skipped).toBe(1);
+    const index = new Database(join(store.paths.backendDir, "chatcrystal", "chatcrystal.db"), {
+      readonly: true,
+    });
+    expect(index.prepare("SELECT source, message_count FROM conversations").get()).toEqual({
+      source: "antigravity",
+      message_count: 2,
+    });
+    expect(index.prepare("SELECT content FROM messages ORDER BY sort_order DESC LIMIT 1").get()).toEqual({
+      content: "The project memory was recorded",
+    });
+    index.close();
+    expect(second.total).toBe(0);
+    expect(second.skipped).toBe(0);
     expect((await purgeChatCrystalProject(store, project)).deleted).toBe(1);
     expect((await syncChatCrystal(store, project)).imported).toBe(1);
   });

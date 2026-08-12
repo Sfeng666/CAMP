@@ -1,12 +1,14 @@
 import Database from "better-sqlite3";
-import { gzipSync } from "node:zlib";
+import { gzip, gzipSync } from "node:zlib";
+import { promisify } from "node:util";
 import { isAbsolute, join, resolve } from "node:path";
 import { chmodSync, existsSync, statSync } from "node:fs";
 import { SCHEMA_VERSION } from "./types.js";
 import { currentCommit, worktreeFingerprint } from "./git.js";
 import { getCampPaths, ensureCampDirectories, ensurePrivateDirectory } from "./paths.js";
 import { automaticMemoryExclusion, containsLikelySecret, redactForRecall } from "./redaction.js";
-import { atomicWrite, fileFingerprint, isInsidePath, newId, nowIso, sha256, stableId } from "./utils.js";
+import { atomicWrite, cooperativeAwait, fileFingerprint, isInsidePath, newId, nowIso, sha256, stableId, } from "./utils.js";
+const gzipAsync = promisify(gzip);
 function json(value, fallback) {
     try {
         return JSON.parse(value);
@@ -274,6 +276,85 @@ export class CampStore {
         checked_at TEXT NOT NULL,
         PRIMARY KEY(project_id, component)
       );
+
+      CREATE TABLE IF NOT EXISTS source_freshness (
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        source TEXT NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        status TEXT NOT NULL CHECK(status IN ('ok', 'degraded', 'never')),
+        last_attempt_at TEXT,
+        last_success_at TEXT,
+        scanned INTEGER NOT NULL DEFAULT 0,
+        imported INTEGER NOT NULL DEFAULT 0,
+        replaced INTEGER NOT NULL DEFAULT 0,
+        skipped INTEGER NOT NULL DEFAULT 0,
+        quarantined INTEGER NOT NULL DEFAULT 0,
+        error_json TEXT,
+        PRIMARY KEY(project_id, source)
+      );
+
+      CREATE TABLE IF NOT EXISTS sync_runs (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        source TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        completed_at TEXT,
+        status TEXT NOT NULL CHECK(status IN ('running', 'ok', 'degraded')),
+        summary_json TEXT,
+        error_json TEXT
+      );
+      CREATE INDEX IF NOT EXISTS sync_run_project_idx
+        ON sync_runs(project_id, source, started_at DESC);
+
+      CREATE TABLE IF NOT EXISTS verification_runs (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        source_agent TEXT NOT NULL,
+        source_surface TEXT NOT NULL,
+        source_client_json TEXT NOT NULL,
+        target_agents_json TEXT NOT NULL,
+        canary TEXT NOT NULL,
+        canary_hash TEXT NOT NULL,
+        evidence_id TEXT NOT NULL REFERENCES evidence(id) ON DELETE CASCADE,
+        raw_session_id TEXT,
+        status TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        cancelled_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS verification_project_idx
+        ON verification_runs(project_id, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS context_receipts (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        verification_run_id TEXT REFERENCES verification_runs(id) ON DELETE SET NULL,
+        client_name TEXT NOT NULL,
+        client_version TEXT NOT NULL,
+        client_instance TEXT NOT NULL,
+        delivery_mode TEXT NOT NULL,
+        challenge_hash TEXT NOT NULL,
+        signature TEXT NOT NULL,
+        verdict TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        issued_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        acknowledged_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS receipt_project_idx
+        ON context_receipts(project_id, issued_at DESC);
+
+      CREATE TABLE IF NOT EXISTS context_acknowledgments (
+        id TEXT PRIMARY KEY,
+        receipt_id TEXT NOT NULL UNIQUE REFERENCES context_receipts(id) ON DELETE CASCADE,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        client_json TEXT NOT NULL,
+        evidence_ids_json TEXT NOT NULL,
+        recalled_fact TEXT NOT NULL,
+        verdict TEXT NOT NULL,
+        reasons_json TEXT NOT NULL,
+        acknowledged_at TEXT NOT NULL
+      );
     `);
         const evidenceColumns = this.db.prepare("PRAGMA table_info(evidence)").all();
         if (!evidenceColumns.some((column) => column.name === "file_fingerprints_json")) {
@@ -417,27 +498,53 @@ export class CampStore {
         const projects = this.listProjects();
         atomicWrite(this.paths.registryExport, `${JSON.stringify({ schemaVersion: SCHEMA_VERSION, projects }, null, 2)}\n`);
     }
-    storeSession(session) {
-        const contentHash = sha256(JSON.stringify({ messages: session.messages, attachments: session.attachments ?? [] }));
-        const sessionId = stableId(session.projectId, session.source, session.nativeId);
-        const existing = this.db
-            .prepare("SELECT content_hash, archive_path FROM sessions WHERE id = ?")
+    storedSession(sessionId) {
+        return this.db
+            .prepare("SELECT content_hash, archive_path, message_count FROM sessions WHERE id = ?")
             .get(sessionId);
-        if (existing?.content_hash === contentHash) {
-            this.db
-                .prepare("UPDATE sessions SET source_path=?, source_fingerprint=?, imported_at=? WHERE id=?")
-                .run(session.sourcePath, session.sourceFingerprint, nowIso(), sessionId);
-            return { sessionId, status: "skipped", archivePath: existing.archive_path };
+    }
+    sessionPrefixMatches(sessionId, messages, count) {
+        if (count < 0 || count > messages.length)
+            return false;
+        if (!count)
+            return true;
+        const rows = this.db
+            .prepare(`
+        SELECT native_id, sequence, role, kind, content_hash, timestamp,
+          tool_name, parent_id, metadata_json
+        FROM messages WHERE session_id=? ORDER BY sequence
+      `)
+            .all(sessionId);
+        if (rows.length !== count)
+            return false;
+        for (let index = 0; index < count; index += 1) {
+            const row = rows[index];
+            const message = messages[index];
+            if (!row ||
+                !message ||
+                String(row.native_id) !== message.id ||
+                Number(row.sequence) !== message.sequence ||
+                String(row.role) !== message.role ||
+                String(row.kind) !== message.kind ||
+                String(row.content_hash) !== sha256(message.content) ||
+                String(row.timestamp) !== message.timestamp ||
+                (row.tool_name === null ? null : String(row.tool_name)) !== (message.toolName ?? null) ||
+                (row.parent_id === null ? null : String(row.parent_id)) !== (message.parentId ?? null) ||
+                String(row.metadata_json) !== JSON.stringify(message.metadata ?? {})) {
+                return false;
+            }
         }
-        const archiveRoot = join(this.paths.archiveDir, session.projectId, session.source);
-        ensurePrivateDirectory(archiveRoot);
-        const archivePath = join(archiveRoot, `${contentHash}.json.gz`);
-        atomicWrite(archivePath, gzipSync(Buffer.from(JSON.stringify(session), "utf8")));
-        const importedAt = nowIso();
+        return true;
+    }
+    commitSession(session, sessionId, contentHash, archivePath, existing) {
         const status = existing ? "replaced" : "imported";
+        const appendFrom = existing && this.sessionPrefixMatches(sessionId, session.messages, existing.message_count)
+            ? existing.message_count
+            : 0;
         const write = this.db.transaction(() => {
-            if (existing)
+            if (existing && appendFrom === 0) {
                 this.db.prepare("DELETE FROM messages WHERE session_id = ?").run(sessionId);
+            }
             this.db
                 .prepare(`
           INSERT INTO sessions (
@@ -464,21 +571,60 @@ export class CampStore {
                 sourceVersion: session.sourceVersion ?? null,
                 attachments: session.attachments ?? [],
                 ingestionCheckpoint: session.ingestionCheckpoint ?? null,
-            }), importedAt);
+            }), nowIso());
             const insert = this.db.prepare(`
         INSERT INTO messages (
           id, session_id, project_id, source, native_id, sequence, role, kind,
           content, content_hash, timestamp, tool_name, parent_id, metadata_json
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
-            for (const message of session.messages) {
+            for (const message of session.messages.slice(appendFrom)) {
                 insert.run(stableId(sessionId, message.id), sessionId, session.projectId, session.source, message.id, message.sequence, message.role, message.kind, message.content, sha256(message.content), message.timestamp, message.toolName ?? null, message.parentId ?? null, JSON.stringify(message.metadata ?? {}));
             }
         });
         write();
         return { sessionId, status, archivePath };
     }
-    getSession(sessionId, projectId) {
+    unchangedSession(session, sessionId, contentHash, existing) {
+        if (existing?.content_hash !== contentHash)
+            return null;
+        this.db
+            .prepare("UPDATE sessions SET source_path=?, source_fingerprint=?, imported_at=? WHERE id=?")
+            .run(session.sourcePath, session.sourceFingerprint, nowIso(), sessionId);
+        return { sessionId, status: "skipped", archivePath: existing.archive_path };
+    }
+    storeSession(session) {
+        const contentHash = sha256(JSON.stringify({ messages: session.messages, attachments: session.attachments ?? [] }));
+        const sessionId = stableId(session.projectId, session.source, session.nativeId);
+        const existing = this.storedSession(sessionId);
+        const unchanged = this.unchangedSession(session, sessionId, contentHash, existing);
+        if (unchanged)
+            return unchanged;
+        const archiveRoot = join(this.paths.archiveDir, session.projectId, session.source);
+        ensurePrivateDirectory(archiveRoot);
+        const archivePath = join(archiveRoot, `${contentHash}.json.gz`);
+        if (!existsSync(archivePath)) {
+            atomicWrite(archivePath, gzipSync(Buffer.from(JSON.stringify(session), "utf8")));
+        }
+        return this.commitSession(session, sessionId, contentHash, archivePath, existing);
+    }
+    async storeSessionAsync(session, cooperate = async () => undefined) {
+        const contentHash = sha256(JSON.stringify({ messages: session.messages, attachments: session.attachments ?? [] }));
+        const sessionId = stableId(session.projectId, session.source, session.nativeId);
+        const existing = this.storedSession(sessionId);
+        const unchanged = this.unchangedSession(session, sessionId, contentHash, existing);
+        if (unchanged)
+            return unchanged;
+        const archiveRoot = join(this.paths.archiveDir, session.projectId, session.source);
+        ensurePrivateDirectory(archiveRoot);
+        const archivePath = join(archiveRoot, `${contentHash}.json.gz`);
+        if (!existsSync(archivePath)) {
+            const compressed = await cooperativeAwait(gzipAsync(Buffer.from(JSON.stringify(session), "utf8")), cooperate);
+            atomicWrite(archivePath, compressed);
+        }
+        return this.commitSession(session, sessionId, contentHash, archivePath, existing);
+    }
+    getSession(sessionId, projectId, maxMessages) {
         const session = this.db
             .prepare(`SELECT * FROM sessions WHERE id = ? ${projectId ? "AND project_id = ?" : ""}`)
             .get(...(projectId ? [sessionId, projectId] : [sessionId]));
@@ -487,9 +633,18 @@ export class CampStore {
         const project = this.getProject(String(session.project_id));
         if (!project)
             return null;
-        const rows = this.db
-            .prepare("SELECT * FROM messages WHERE session_id = ? ORDER BY sequence")
-            .all(sessionId);
+        const bounded = maxMessages && maxMessages > 0 ? Math.max(1, Math.floor(maxMessages)) : null;
+        const rows = bounded
+            ? this.db
+                .prepare(`
+            SELECT * FROM (
+              SELECT * FROM messages WHERE session_id=? ORDER BY sequence DESC LIMIT ?
+            ) ORDER BY sequence
+          `)
+                .all(sessionId, bounded)
+            : this.db
+                .prepare("SELECT * FROM messages WHERE session_id = ? ORDER BY sequence")
+                .all(sessionId);
         const storedMetadata = json(String(session.metadata_json), {});
         const campEnvelope = storedMetadata.__campSession === 1;
         const attachments = campEnvelope && Array.isArray(storedMetadata.attachments)
@@ -522,7 +677,7 @@ export class CampStore {
                 sequence: Number(row.sequence),
                 role: String(row.role),
                 kind: String(row.kind),
-                content: String(row.content),
+                content: bounded ? String(row.content).slice(0, 12_000) : String(row.content),
                 timestamp: String(row.timestamp),
                 ...(row.tool_name ? { toolName: String(row.tool_name) } : {}),
                 ...(row.parent_id ? { parentId: String(row.parent_id) } : {}),
@@ -541,13 +696,67 @@ export class CampStore {
             .all(projectId);
         return rows.map((row) => row.id);
     }
+    listOrdinarySessionIds(projectId) {
+        const rows = this.db
+            .prepare(`
+        SELECT s.id FROM sessions s
+        WHERE s.project_id=?
+          AND NOT EXISTS (
+            SELECT 1 FROM verification_runs v WHERE v.raw_session_id=s.id
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM messages vm
+            WHERE vm.session_id=s.id AND instr(vm.content, 'CAMP-CANARY-') > 0
+          )
+        ORDER BY s.imported_at
+      `)
+            .all(projectId);
+        return rows.map((row) => row.id);
+    }
+    listSessionIdsSince(projectId, importedAfter) {
+        const rows = this.db
+            .prepare(`
+        SELECT id FROM sessions
+        WHERE project_id=? AND message_count>=2
+          ${importedAfter ? "AND imported_at>?" : ""}
+        ORDER BY imported_at, id
+      `)
+            .all(...(importedAfter ? [projectId, importedAfter] : [projectId]));
+        return rows.map((row) => row.id);
+    }
+    sessionArchiveInfo(sessionId, projectId) {
+        const row = this.db
+            .prepare(`
+        SELECT archive_path, source_path, message_count FROM sessions
+        WHERE id=? AND project_id=?
+      `)
+            .get(sessionId, projectId);
+        return row
+            ? {
+                archivePath: row.archive_path,
+                sourcePath: row.source_path,
+                messageCount: Number(row.message_count),
+            }
+            : null;
+    }
     latestSession(projectId) {
         const row = this.db
-            .prepare("SELECT id FROM sessions WHERE project_id=? ORDER BY ended_at DESC, imported_at DESC LIMIT 1")
+            .prepare(`
+        SELECT s.id FROM sessions s
+        WHERE s.project_id=?
+          AND NOT EXISTS (
+            SELECT 1 FROM verification_runs v WHERE v.raw_session_id=s.id
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM messages vm
+            WHERE vm.session_id=s.id AND instr(vm.content, 'CAMP-CANARY-') > 0
+          )
+        ORDER BY s.ended_at DESC, s.imported_at DESC LIMIT 1
+      `)
             .get(projectId);
         if (!row)
             return null;
-        const session = this.getSession(row.id, projectId);
+        const session = this.getSession(row.id, projectId, 120);
         return session ? { id: row.id, session } : null;
     }
     fingerprintFiles(projectId, relevantFiles) {
@@ -719,6 +928,13 @@ export class CampStore {
           FROM messages_fts
           JOIN messages m ON m.rowid = messages_fts.rowid
           WHERE messages_fts MATCH ? AND m.project_id = ?
+            AND NOT EXISTS (
+              SELECT 1 FROM verification_runs v WHERE v.raw_session_id=m.session_id
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM messages vm
+              WHERE vm.session_id=m.session_id AND instr(vm.content, 'CAMP-CANARY-') > 0
+            )
           ORDER BY rank LIMIT ?
         `)
                 .all(expression, projectId, limit);
@@ -785,7 +1001,15 @@ export class CampStore {
         FROM messages m
         LEFT JOIN semantic_documents s
           ON s.project_id=m.project_id AND s.layer='raw' AND s.document_id=m.id
-        WHERE m.project_id=? AND (
+        WHERE m.project_id=?
+          AND NOT EXISTS (
+            SELECT 1 FROM verification_runs v WHERE v.raw_session_id=m.session_id
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM messages vm
+            WHERE vm.session_id=m.session_id AND instr(vm.content, 'CAMP-CANARY-') > 0
+          )
+          AND (
           s.document_id IS NULL OR s.model_digest<>? OR s.content_hash<>m.content_hash
         )
         ORDER BY m.timestamp DESC LIMIT ?
@@ -814,23 +1038,48 @@ export class CampStore {
       `)
             .run(input.projectId, input.layer, input.documentId, input.contentHash, input.model, input.modelDigest, JSON.stringify(input.vector), nowIso());
     }
-    *semanticVectors(projectId, modelDigest, source = "all") {
-        const rows = this.db
-            .prepare(`
-        SELECT layer, document_id, vector_json FROM semantic_documents
-        WHERE project_id=? AND model_digest=? ${source === "all" ? "" : "AND layer=?"}
-      `)
-            .iterate(...(source === "all" ? [projectId, modelDigest] : [projectId, modelDigest, source]));
-        for (const row of rows) {
-            const vector = json(row.vector_json, []);
-            if (vector.length)
-                yield { layer: row.layer, documentId: row.document_id, vector };
+    *semanticVectors(projectId, modelDigest, source = "all", limit = 512) {
+        const bounded = Math.max(1, Math.min(2_048, Math.floor(limit)));
+        const layers = source === "all"
+            ? [
+                { layer: "curated", budget: Math.min(128, bounded) },
+                { layer: "raw", budget: Math.max(0, bounded - Math.min(128, bounded)) },
+            ]
+            : [{ layer: source, budget: bounded }];
+        for (const { layer, budget } of layers) {
+            if (!budget)
+                continue;
+            // JSON vectors are deliberately bounded here. Loading an entire large
+            // archive (6k documents can exceed 80 MB) blocks the daemon event loop
+            // and can make an MCP receipt time out. Lexical FTS searches the full
+            // archive; semantic ranking supplements it with the newest bounded set.
+            const rows = this.db
+                .prepare(`
+          SELECT layer, document_id, vector_json FROM semantic_documents
+          WHERE project_id=? AND model_digest=? AND layer=?
+          ORDER BY rowid DESC LIMIT ?
+        `)
+                .iterate(projectId, modelDigest, layer, budget);
+            for (const row of rows) {
+                const vector = json(row.vector_json, []);
+                if (vector.length)
+                    yield { layer: row.layer, documentId: row.document_id, vector };
+            }
         }
     }
     searchHitByDocument(projectId, layer, id, score) {
         if (layer === "raw") {
             const row = this.db
-                .prepare("SELECT * FROM messages WHERE project_id=? AND id=?")
+                .prepare(`
+          SELECT m.* FROM messages m WHERE m.project_id=? AND m.id=?
+            AND NOT EXISTS (
+              SELECT 1 FROM verification_runs v WHERE v.raw_session_id=m.session_id
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM messages vm
+              WHERE vm.session_id=m.session_id AND instr(vm.content, 'CAMP-CANARY-') > 0
+            )
+        `)
                 .get(projectId, id);
             if (!row)
                 return null;
@@ -880,10 +1129,26 @@ export class CampStore {
         return this.db.prepare(sql).all(...(projectId ? [projectId] : []));
     }
     resolveQuarantine(id, projectId) {
-        const result = this.db
-            .prepare("UPDATE quarantine SET resolved_at=?, resolved_project_id=? WHERE id=? AND resolved_at IS NULL")
-            .run(nowIso(), projectId, id);
-        return result.changes > 0;
+        const resolve = this.db.transaction(() => {
+            const row = this.db
+                .prepare("SELECT source, source_path, native_id FROM quarantine WHERE id=? AND resolved_at IS NULL")
+                .get(id);
+            if (!row)
+                return false;
+            const result = this.db
+                .prepare("UPDATE quarantine SET resolved_at=?, resolved_project_id=? WHERE id=? AND resolved_at IS NULL")
+                .run(nowIso(), projectId, id);
+            if (!result.changes)
+                return false;
+            // Parent-workspace quarantines are negatively checkpointed so normal
+            // polling is cheap. Explicit assignment invalidates only that exact
+            // attribution result and lets the next scan import it once.
+            this.db
+                .prepare("DELETE FROM checkpoints WHERE project_id=? AND source=? AND key IN (?, ?)")
+                .run(projectId, row.source, stableId(row.source_path), stableId(row.source_path, row.native_id));
+            return true;
+        });
+        return resolve();
     }
     isSourceAssigned(source, sourcePath, nativeId, projectId) {
         const row = this.db
@@ -1042,7 +1307,410 @@ export class CampStore {
                 detail: row.detail,
                 checkedAt: row.checked_at,
             })),
+            freshness: this.sourceFreshness(projectId),
         };
+    }
+    beginSourceSync(projectId, source) {
+        const id = newId();
+        const now = nowIso();
+        const transaction = this.db.transaction(() => {
+            this.db
+                .prepare(`
+          INSERT INTO sync_runs(id, project_id, source, started_at, status)
+          VALUES (?, ?, ?, ?, 'running')
+        `)
+                .run(id, projectId, source, now);
+            this.db
+                .prepare(`
+          INSERT INTO source_freshness(project_id, source, enabled, status, last_attempt_at)
+          VALUES (?, ?, 1, 'never', ?)
+          ON CONFLICT(project_id, source) DO UPDATE SET
+            enabled=1, last_attempt_at=excluded.last_attempt_at
+        `)
+                .run(projectId, source, now);
+        });
+        transaction();
+        return id;
+    }
+    projectSyncInProgress(projectId) {
+        return Boolean(this.db
+            .prepare("SELECT 1 FROM sync_runs WHERE project_id=? AND status='running' LIMIT 1")
+            .get(projectId));
+    }
+    recoverInterruptedSyncs() {
+        const rows = this.db
+            .prepare("SELECT id, project_id, source FROM sync_runs WHERE status='running'")
+            .all();
+        if (!rows.length)
+            return 0;
+        const completedAt = nowIso();
+        const error = JSON.stringify({
+            phase: "recovery",
+            message: "Previous CAMP daemon stopped during this source scan",
+            timestamp: completedAt,
+        });
+        const transaction = this.db.transaction(() => {
+            const finish = this.db.prepare("UPDATE sync_runs SET completed_at=?, status='degraded', error_json=? WHERE id=?");
+            const degrade = this.db.prepare(`
+        UPDATE source_freshness SET status='degraded', error_json=?
+        WHERE project_id=? AND source=?
+      `);
+            for (const row of rows) {
+                finish.run(completedAt, error, row.id);
+                degrade.run(error, row.project_id, row.source);
+            }
+        });
+        transaction();
+        return rows.length;
+    }
+    finishSourceSync(runId, projectId, summary) {
+        const now = nowIso();
+        const error = summary.errorDetails?.[0] ?? null;
+        const degraded = summary.errors.length > 0;
+        const transaction = this.db.transaction(() => {
+            this.db
+                .prepare(`
+          UPDATE sync_runs SET completed_at=?, status=?, summary_json=?, error_json=?
+          WHERE id=? AND project_id=?
+        `)
+                .run(now, degraded ? "degraded" : "ok", JSON.stringify(summary), error ? JSON.stringify(error) : null, runId, projectId);
+            this.db
+                .prepare(`
+          INSERT INTO source_freshness(
+            project_id, source, enabled, status, last_attempt_at, last_success_at,
+            scanned, imported, replaced, skipped, quarantined, error_json
+          ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(project_id, source) DO UPDATE SET
+            enabled=1,
+            status=excluded.status,
+            last_attempt_at=excluded.last_attempt_at,
+            last_success_at=CASE
+              WHEN excluded.status='ok' THEN excluded.last_success_at
+              ELSE source_freshness.last_success_at
+            END,
+            scanned=excluded.scanned,
+            imported=excluded.imported,
+            replaced=excluded.replaced,
+            skipped=excluded.skipped,
+            quarantined=excluded.quarantined,
+            error_json=excluded.error_json
+        `)
+                .run(projectId, summary.source, degraded ? "degraded" : "ok", now, degraded ? null : now, summary.scanned, summary.imported, summary.replaced, summary.skipped, summary.quarantined, error ? JSON.stringify(error) : degraded ? JSON.stringify({ message: summary.errors[0] }) : null);
+        });
+        transaction();
+    }
+    sourceFreshness(projectId) {
+        const rows = this.db
+            .prepare(`
+        SELECT source, enabled, status, last_attempt_at, last_success_at,
+          scanned, imported, replaced, skipped, quarantined, error_json
+        FROM source_freshness WHERE project_id=? ORDER BY source
+      `)
+            .all(projectId);
+        const now = Date.now();
+        return rows.map((row) => {
+            const success = typeof row.last_success_at === "string" ? row.last_success_at : null;
+            return {
+                source: row.source,
+                enabled: Boolean(row.enabled),
+                status: row.status,
+                lastAttemptAt: typeof row.last_attempt_at === "string" ? row.last_attempt_at : null,
+                lastSuccessfulScanAt: success,
+                lagSeconds: success ? Math.max(0, Math.floor((now - Date.parse(success)) / 1000)) : null,
+                scanned: Number(row.scanned ?? 0),
+                imported: Number(row.imported ?? 0),
+                replaced: Number(row.replaced ?? 0),
+                skipped: Number(row.skipped ?? 0),
+                quarantined: Number(row.quarantined ?? 0),
+                error: typeof row.error_json === "string"
+                    ? json(row.error_json, null)
+                    : null,
+            };
+        });
+    }
+    putContextReceipt(receipt, challengeHash) {
+        const stored = { ...receipt, challenge: "" };
+        this.db
+            .prepare(`
+        INSERT INTO context_receipts(
+          id, project_id, verification_run_id, client_name, client_version,
+          client_instance, delivery_mode, challenge_hash, signature, verdict,
+          payload_json, issued_at, expires_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+            .run(receipt.id, receipt.projectId, receipt.verificationRunId, receipt.client.name, receipt.client.version, receipt.client.instanceId, receipt.deliveryMode, challengeHash, receipt.signature, receipt.verdict, JSON.stringify(stored), receipt.issuedAt, receipt.expiresAt);
+    }
+    contextReceipt(id) {
+        const row = this.db
+            .prepare("SELECT payload_json, challenge_hash, acknowledged_at FROM context_receipts WHERE id=?")
+            .get(id);
+        if (!row)
+            return null;
+        return {
+            receipt: json(row.payload_json, {}),
+            challengeHash: row.challenge_hash,
+            acknowledgedAt: row.acknowledged_at,
+        };
+    }
+    contextAcknowledgment(receiptId) {
+        const row = this.db
+            .prepare("SELECT * FROM context_acknowledgments WHERE receipt_id=?")
+            .get(receiptId);
+        if (!row)
+            return null;
+        return {
+            schemaVersion: 1,
+            id: String(row.id),
+            receiptId: String(row.receipt_id),
+            projectId: String(row.project_id),
+            client: json(String(row.client_json), {
+                name: "unknown",
+                version: "unknown",
+                instanceId: "unknown",
+            }),
+            evidenceIds: json(String(row.evidence_ids_json), []),
+            recalledFact: String(row.recalled_fact),
+            acknowledgedAt: String(row.acknowledged_at),
+            verdict: row.verdict,
+            reasons: json(String(row.reasons_json), []),
+        };
+    }
+    putContextAcknowledgment(acknowledgment) {
+        const transaction = this.db.transaction(() => {
+            this.db
+                .prepare(`
+          INSERT INTO context_acknowledgments(
+            id, receipt_id, project_id, client_json, evidence_ids_json,
+            recalled_fact, verdict, reasons_json, acknowledged_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `)
+                .run(acknowledgment.id, acknowledgment.receiptId, acknowledgment.projectId, JSON.stringify(acknowledgment.client), JSON.stringify(acknowledgment.evidenceIds), acknowledgment.recalledFact, acknowledgment.verdict, JSON.stringify(acknowledgment.reasons), acknowledgment.acknowledgedAt);
+            this.db
+                .prepare("UPDATE context_receipts SET acknowledged_at=?, verdict=? WHERE id=?")
+                .run(acknowledgment.acknowledgedAt, acknowledgment.verdict, acknowledgment.receiptId);
+        });
+        transaction();
+    }
+    createVerificationRun(input) {
+        const createdAt = nowIso();
+        const expiresAt = new Date(Date.parse(createdAt) + input.ttlSeconds * 1000).toISOString();
+        const id = newId();
+        const record = this.putEvidence({
+            projectId: input.project.id,
+            kind: "verification",
+            state: "quarantined",
+            title: `CAMP cross-agent canary ${id}`,
+            content: `Verification canary ${input.canary}`,
+            confidence: 1,
+            sourceAgent: input.sourceAgent,
+            sourceSessionId: null,
+            sourceUri: `camp://verification/${id}`,
+            relevantFiles: [],
+            commit: currentCommit(input.project.rootPath),
+            worktreeFingerprint: worktreeFingerprint(input.project.rootPath),
+        });
+        const run = {
+            schemaVersion: 1,
+            id,
+            projectId: input.project.id,
+            sourceAgent: input.sourceAgent,
+            sourceSurface: input.sourceSurface,
+            sourceClient: input.sourceClient,
+            targetAgents: input.targetAgents,
+            canary: input.canary,
+            canaryHash: sha256(input.canary),
+            evidenceId: record.id,
+            rawSessionId: null,
+            status: "awaiting_import",
+            createdAt,
+            expiresAt,
+            cancelledAt: null,
+        };
+        this.db
+            .prepare(`
+        INSERT INTO verification_runs(
+          id, project_id, source_agent, source_surface, source_client_json,
+          target_agents_json, canary, canary_hash, evidence_id, raw_session_id,
+          status, created_at, expires_at, cancelled_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, NULL)
+      `)
+            .run(run.id, run.projectId, run.sourceAgent, run.sourceSurface, JSON.stringify(run.sourceClient), JSON.stringify(run.targetAgents), run.canary, run.canaryHash, run.evidenceId, run.status, run.createdAt, run.expiresAt);
+        return run;
+    }
+    verificationRun(id) {
+        const row = this.db.prepare("SELECT * FROM verification_runs WHERE id=?").get(id);
+        if (!row)
+            return null;
+        let status = String(row.status);
+        const expired = Date.parse(String(row.expires_at)) <= Date.now();
+        const alreadyScrubbed = String(row.canary).startsWith("expired:");
+        if (!row.cancelled_at && expired && !alreadyScrubbed) {
+            if (status !== "passed")
+                status = "expired";
+            const scrubbed = `Expired CAMP verification ${String(row.canary_hash).slice(0, 16)}`;
+            const transaction = this.db.transaction(() => {
+                this.db.prepare("UPDATE verification_runs SET status=?, canary=? WHERE id=?").run(status, `expired:${String(row.canary_hash).slice(0, 16)}`, id);
+                this.db
+                    .prepare("UPDATE evidence SET title=?, content=?, content_hash=?, updated_at=? WHERE id=?")
+                    .run(scrubbed, scrubbed, sha256(scrubbed), nowIso(), String(row.evidence_id));
+            });
+            transaction();
+        }
+        return {
+            schemaVersion: 1,
+            id: String(row.id),
+            projectId: String(row.project_id),
+            sourceAgent: row.source_agent,
+            sourceSurface: row.source_surface,
+            sourceClient: json(String(row.source_client_json), {
+                name: "unknown",
+                version: "unknown",
+                instanceId: "unknown",
+            }),
+            targetAgents: json(String(row.target_agents_json), []),
+            canary: expired ? "" : String(row.canary),
+            canaryHash: String(row.canary_hash),
+            evidenceId: String(row.evidence_id),
+            rawSessionId: typeof row.raw_session_id === "string" ? row.raw_session_id : null,
+            status,
+            createdAt: String(row.created_at),
+            expiresAt: String(row.expires_at),
+            cancelledAt: typeof row.cancelled_at === "string" ? row.cancelled_at : null,
+        };
+    }
+    refreshVerificationRun(id) {
+        const run = this.verificationRun(id);
+        if (!run || run.status === "cancelled" || run.status === "expired")
+            return run;
+        if (!run.rawSessionId && run.canary) {
+            const rows = this.db
+                .prepare(`
+          SELECT DISTINCT m.session_id, max(m.timestamp) AS marker_at
+          FROM messages m
+          JOIN sessions s ON s.id=m.session_id
+          WHERE m.project_id=? AND m.source=? AND instr(m.content, ?) > 0
+            AND m.timestamp>=? AND s.ended_at>=?
+          GROUP BY m.session_id
+          ORDER BY marker_at DESC
+        `)
+                .all(run.projectId, run.sourceAgent, run.canary, run.createdAt, run.createdAt);
+            const row = rows.find((candidate) => {
+                const session = this.getSession(candidate.session_id, run.projectId);
+                return Boolean(session &&
+                    (run.sourceSurface === "unknown" || session.surface === run.sourceSurface));
+            });
+            if (row) {
+                const matched = this.getSession(row.session_id, run.projectId);
+                const provenSurface = run.sourceSurface === "unknown" && matched
+                    ? matched.surface
+                    : run.sourceSurface;
+                this.db
+                    .prepare("UPDATE verification_runs SET source_surface=?, raw_session_id=?, status='ready' WHERE id=?")
+                    .run(provenSurface, row.session_id, id);
+            }
+        }
+        return this.verificationRun(id);
+    }
+    refreshProjectVerificationRuns(projectId) {
+        const rows = this.db
+            .prepare(`
+        SELECT id FROM verification_runs
+        WHERE project_id=? AND status IN ('awaiting_source', 'awaiting_import', 'ready')
+        ORDER BY created_at
+      `)
+            .all(projectId);
+        return rows
+            .map((row) => this.refreshVerificationRun(row.id))
+            .filter((run) => run !== null);
+    }
+    verificationSearchHits(run) {
+        const hits = [];
+        const evidence = this.getEvidence(run.evidenceId);
+        if (evidence) {
+            hits.push({
+                layer: "curated",
+                id: evidence.id,
+                projectId: evidence.projectId,
+                source: evidence.sourceAgent,
+                title: evidence.title,
+                content: redactForRecall(evidence.content),
+                timestamp: evidence.updatedAt,
+                score: 10_000,
+                uri: evidence.sourceUri ?? `camp://project/${evidence.projectId}/memory/${evidence.id}`,
+                state: evidence.state,
+            });
+        }
+        if (run.rawSessionId && run.canary) {
+            const row = this.db
+                .prepare(`
+          SELECT id, session_id, project_id, source, role, content, timestamp
+          FROM messages
+          WHERE project_id=? AND session_id=? AND instr(content, ?) > 0
+          ORDER BY sequence LIMIT 1
+        `)
+                .get(run.projectId, run.rawSessionId, run.canary);
+            if (row) {
+                hits.push({
+                    layer: "raw",
+                    id: String(row.id),
+                    projectId: String(row.project_id),
+                    source: String(row.source),
+                    title: `${String(row.source)} ${String(row.role)} canary message`,
+                    content: redactForRecall(String(row.content)),
+                    timestamp: String(row.timestamp),
+                    score: 20_000,
+                    uri: `camp://project/${String(row.project_id)}/conversation/${String(row.session_id)}#message=${String(row.id)}`,
+                });
+            }
+        }
+        return hits;
+    }
+    verificationAcknowledgments(runId) {
+        const rows = this.db
+            .prepare(`
+        SELECT a.* FROM context_acknowledgments a
+        JOIN context_receipts r ON r.id=a.receipt_id
+        WHERE r.verification_run_id=? ORDER BY a.acknowledged_at
+      `)
+            .all(runId);
+        return rows.map((row) => ({
+            schemaVersion: 1,
+            id: String(row.id),
+            receiptId: String(row.receipt_id),
+            projectId: String(row.project_id),
+            client: json(String(row.client_json), {
+                name: "unknown",
+                version: "unknown",
+                instanceId: "unknown",
+            }),
+            evidenceIds: json(String(row.evidence_ids_json), []),
+            recalledFact: String(row.recalled_fact),
+            acknowledgedAt: String(row.acknowledged_at),
+            verdict: row.verdict,
+            reasons: json(String(row.reasons_json), []),
+        }));
+    }
+    setVerificationStatus(id, status) {
+        this.db.prepare("UPDATE verification_runs SET status=? WHERE id=?").run(status, id);
+    }
+    cancelVerificationRun(id) {
+        const now = nowIso();
+        const run = this.verificationRun(id);
+        if (!run)
+            return null;
+        if (run.status === "passed" || run.status === "cancelled" || run.status === "expired")
+            return run;
+        const scrubbed = `Cancelled CAMP verification ${run.canaryHash.slice(0, 16)}`;
+        const transaction = this.db.transaction(() => {
+            this.db
+                .prepare("UPDATE verification_runs SET status='cancelled', cancelled_at=?, canary=? WHERE id=?")
+                .run(now, `cancelled:${run.canaryHash.slice(0, 16)}`, id);
+            this.db
+                .prepare("UPDATE evidence SET title=?, content=?, content_hash=?, updated_at=? WHERE id=?")
+                .run(scrubbed, scrubbed, sha256(scrubbed), now, run.evidenceId);
+        });
+        transaction();
+        return this.verificationRun(id);
     }
     recordHealth(projectId, component, status, detail) {
         this.db

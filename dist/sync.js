@@ -1,14 +1,27 @@
 import { importProjectHistory } from "./importers/index.js";
 import { syncChatCrystal } from "./backends/chatcrystal.js";
-import { finalizeMemorixMigration, flushMemorix, prepareMemorixMigration } from "./backends/memorix.js";
+import { finalizeMemorixMigration, flushMemorix, prepareMemorixMigration, } from "./backends/memorix.js";
 import { queueMemorix } from "./backends/memorix.js";
 import { changedPaths } from "./git.js";
 import { redactForRecall } from "./redaction.js";
-import { truncateByApproxTokens } from "./utils.js";
+import { cooperativeAwait, truncateByApproxTokens } from "./utils.js";
 import { syncSemanticIndex } from "./semantic.js";
 import { summarizeSessionLocally } from "./summarization.js";
 import { readProjectHandoff } from "./project-handoff.js";
-export async function createAutomaticHandoff(store, project) {
+export async function syncProjectSources(store, project, onSource, cooperate = async () => undefined) {
+    store.refreshStaleness(project.id);
+    const imports = await importProjectHistory(store, project, onSource, undefined, cooperate);
+    // Link unpredictable verification markers to the exact source surface
+    // before a target asks for verification-scoped evidence.
+    store.refreshProjectVerificationRuns(project.id);
+    for (const summary of imports) {
+        store.recordHealth(project.id, `source:${summary.source}`, summary.errors.length ? "degraded" : "ok", summary.errors.length
+            ? summary.errors.join("; ")
+            : `scanned=${summary.scanned} imported=${summary.imported} skipped=${summary.skipped} quarantined=${summary.quarantined}`);
+    }
+    return imports;
+}
+export async function createAutomaticHandoff(store, project, cooperate = async () => undefined) {
     const latest = store.latestSession(project.id);
     if (!latest || latest.session.messages.length < 2)
         return null;
@@ -29,7 +42,8 @@ export async function createAutomaticHandoff(store, project) {
     }
     const substantiveUser = latest.session.messages
         .filter((message) => message.role === "user" &&
-        !/^\s*<(?:recommended_plugins|environment_context|permissions instructions|skills_instructions)[>\s]/i.test(message.content))
+        !/^\s*<(?:recommended_plugins|environment_context|permissions instructions|skills_instructions)[>\s]/i.test(message.content) &&
+        !/(?:camp_context_for_task|camp_ack_context|camp_start_verification|verify CAMP context|acknowledge(?:ment)? (?:the )?(?:exact )?(?:CAMP )?(?:context )?receipt)/i.test(message.content))
         .at(-1);
     if (!substantiveUser)
         return null;
@@ -44,7 +58,7 @@ export async function createAutomaticHandoff(store, project) {
         .filter((line) => /\b(?:test|typecheck|build|lint)\b.*\b(?:pass(?:ed)?|fail(?:ed)?|exit(?:ed)?\s+\d+)\b/i.test(line))
         .slice(0, 5)
         .map((line) => truncateByApproxTokens(line.trim(), 80));
-    const localSummary = await summarizeSessionLocally(latest.session);
+    const localSummary = await cooperativeAwait(summarizeSessionLocally(latest.session), cooperate);
     try {
         const record = store.createHandoff(project, {
             goal: localSummary?.goal ?? goal,
@@ -77,18 +91,16 @@ export async function createAutomaticHandoff(store, project) {
         throw error;
     }
 }
-export async function syncProject(store, project, onSource) {
+export async function syncProject(store, project, onSource, cooperate = async () => undefined) {
+    const imports = await syncProjectSources(store, project, onSource, cooperate);
+    return syncProjectBackends(store, project, imports, cooperate);
+}
+export async function syncProjectBackends(store, project, imports = [], cooperate = async () => undefined) {
     const errors = [];
-    store.refreshStaleness(project.id);
-    const imports = await importProjectHistory(store, project, onSource);
-    for (const summary of imports) {
-        store.recordHealth(project.id, `source:${summary.source}`, summary.errors.length ? "degraded" : "ok", summary.errors.length
-            ? summary.errors.join("; ")
-            : `scanned=${summary.scanned} imported=${summary.imported} skipped=${summary.skipped} quarantined=${summary.quarantined}`);
-    }
+    await cooperate();
     let chatcrystal = null;
     try {
-        const result = await syncChatCrystal(store, project);
+        const result = await syncChatCrystal(store, project, cooperate);
         // ChatCrystal's pinned ingest response also carries one entry per session.
         // Keep CAMP's public status bounded even for large historical archives.
         chatcrystal = {
@@ -108,18 +120,20 @@ export async function syncProject(store, project, onSource) {
     }
     let automaticHandoff = null;
     try {
-        automaticHandoff = await createAutomaticHandoff(store, project);
+        automaticHandoff = await createAutomaticHandoff(store, project, cooperate);
     }
     catch (error) {
         errors.push(`Handoff: ${error instanceof Error ? error.message : String(error)}`);
     }
+    await cooperate();
     prepareMemorixMigration(store, project);
-    const memorix = flushMemorix(store, project);
+    const memorix = await flushMemorix(store, project, cooperate);
     store.recordHealth(project.id, "backend:memorix", memorix.failed || memorix.unavailable ? "degraded" : "ok", memorix.unavailable
         ? "unavailable; curated writes remain queued"
-        : `completed=${memorix.completed} failed=${memorix.failed}`);
+        : `completed=${memorix.completed} failed=${memorix.failed} pending=${memorix.pending}`);
     finalizeMemorixMigration(store, project);
-    const semantic = await syncSemanticIndex(store, project);
+    await cooperate();
+    const semantic = await syncSemanticIndex(store, project, 1, cooperate);
     store.recordHealth(project.id, "semantic:ollama", semantic.degraded ? "degraded" : "ok", semantic.degraded
         ? "local embeddings unavailable or awaiting explicit reindex; lexical FTS active"
         : `indexed=${semantic.indexed} pending=${semantic.pending}`);

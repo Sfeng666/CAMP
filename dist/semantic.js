@@ -1,5 +1,5 @@
 import { getCampPaths } from "./paths.js";
-import { readJsonFile } from "./utils.js";
+import { cooperativeAwait, readJsonFile } from "./utils.js";
 const EMBEDDING_MODEL = "qwen3-embedding:0.6b";
 const OLLAMA_EMBED_URL = "http://127.0.0.1:11434/api/embed";
 function embeddingDigest() {
@@ -50,7 +50,7 @@ function cosine(left, right) {
         return -1;
     return dot / Math.sqrt(leftNorm * rightNorm);
 }
-export async function syncSemanticIndex(store, project, limit = 1) {
+export async function syncSemanticIndex(store, project, limit = 1, cooperate = async () => undefined) {
     const model = embeddingDigest();
     if (!model)
         return { indexed: 0, pending: 0, degraded: true };
@@ -60,7 +60,7 @@ export async function syncSemanticIndex(store, project, limit = 1) {
     let indexed = 0;
     for (let offset = 0; offset < candidates.length; offset += 4) {
         const chunk = candidates.slice(offset, offset + 4);
-        const vectors = await embed(chunk.map((candidate) => candidate.content.slice(0, 1_000)), model.model, 30_000);
+        const vectors = await cooperativeAwait(embed(chunk.map((candidate) => candidate.content.slice(0, 1_000)), model.model, 30_000), cooperate);
         if (!vectors) {
             return { indexed, pending: candidates.length - indexed, degraded: true };
         }
