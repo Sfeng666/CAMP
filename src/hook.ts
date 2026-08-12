@@ -1,5 +1,4 @@
-import { spawn } from "node:child_process";
-import { appendFileSync, chmodSync, existsSync } from "node:fs";
+import { appendFileSync, chmodSync } from "node:fs";
 import { join } from "node:path";
 import type { AgentSource, ProjectRegistration } from "./types.js";
 import { ensurePrivateDirectory, getCampPaths } from "./paths.js";
@@ -21,7 +20,10 @@ function firstString(...values: unknown[]): string | null {
   return null;
 }
 
-function projectForPayload(store: CampStore, payload: Record<string, unknown>): ProjectRegistration | null {
+export function projectForHookPayload(
+  store: CampStore,
+  payload: Record<string, unknown>,
+): ProjectRegistration | null {
   const workspacePaths = Array.isArray(payload.workspacePaths) ? payload.workspacePaths : [];
   const roots = Array.isArray(payload.workspace_roots) ? payload.workspace_roots : [];
   const candidates = [
@@ -130,23 +132,13 @@ function triggerFastSync(
   agent: AgentSource,
   sessionId: string | null,
   event: string,
+  requestFastSync?: (projectId: string) => void,
 ): void {
-  if (!project || !/SessionStart|PreInvocation/i.test(event)) return;
+  if (!project || !/SessionStart|PreInvocation|PostInvocation|Stop/i.test(event)) return;
   const key = `fast-sync:${sessionId ?? event}`;
   if (store.checkpoint(project.id, agent, key)) return;
   store.setCheckpoint(project.id, agent, key, nowIso());
-  const cliPath = process.argv[1];
-  if (!cliPath || !existsSync(cliPath) || !/cli\.(?:js|ts)$/.test(cliPath)) return;
-  const args = cliPath.endsWith(".ts")
-    ? ["--import", "tsx", cliPath, "sync", project.id, "--once"]
-    : [cliPath, "sync", project.id, "--once"];
-  const child = spawn(process.execPath, args, {
-    cwd: project.rootPath,
-    detached: true,
-    env: process.env,
-    stdio: "ignore",
-  });
-  child.unref();
+  requestFastSync?.(project.id);
 }
 
 export function captureHook(
@@ -154,8 +146,9 @@ export function captureHook(
   agent: AgentSource,
   event: string,
   payload: Record<string, unknown>,
+  requestFastSync?: (projectId: string) => void,
 ): Record<string, unknown> {
-  const project = projectForPayload(store, payload);
+  const project = projectForHookPayload(store, payload);
   const sessionId = firstString(
     payload.conversationId,
     payload.conversation_id,
@@ -180,7 +173,7 @@ export function captureHook(
   } catch {
     // Best effort on non-POSIX filesystems.
   }
-  triggerFastSync(store, project, agent, sessionId, event);
+  triggerFastSync(store, project, agent, sessionId, event, requestFastSync);
   const taskContext = /^(?:UserPromptSubmit|PreInvocation)$/.test(event)
     ? firstTaskContext(store, project, agent, sessionId, payload)
     : null;

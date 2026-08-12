@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import type { AgentSource, CanonicalSession, EvidenceRecord, HandoffInput, ProjectRegistration, SearchHit } from "./types.js";
+import type { AgentSource, CanonicalSession, EvidenceRecord, HandoffInput, ContextAcknowledgment, ContextReceipt, ImportErrorDetail, ProjectRegistration, SearchHit, SourceFreshness, VerificationRun } from "./types.js";
 import type { InspectedProject } from "./git.js";
 type SqliteDatabase = InstanceType<typeof Database>;
 export interface StoreSessionResult {
@@ -23,6 +23,7 @@ export interface ProjectStatus {
         detail: string;
         checkedAt: string;
     }>;
+    freshness: SourceFreshness[];
 }
 export interface SemanticCandidate {
     layer: "raw" | "curated";
@@ -49,9 +50,21 @@ export declare class CampStore {
     listProjects(): ProjectRegistration[];
     private projectFromRow;
     exportRegistry(): void;
+    private storedSession;
+    private sessionPrefixMatches;
+    private commitSession;
+    private unchangedSession;
     storeSession(session: CanonicalSession): StoreSessionResult;
-    getSession(sessionId: string, projectId?: string): CanonicalSession | null;
+    storeSessionAsync(session: CanonicalSession, cooperate?: () => Promise<void>): Promise<StoreSessionResult>;
+    getSession(sessionId: string, projectId?: string, maxMessages?: number): CanonicalSession | null;
     listSessionIds(projectId: string): string[];
+    listOrdinarySessionIds(projectId: string): string[];
+    listSessionIdsSince(projectId: string, importedAfter: string | null): string[];
+    sessionArchiveInfo(sessionId: string, projectId: string): {
+        archivePath: string;
+        sourcePath: string;
+        messageCount: number;
+    } | null;
     latestSession(projectId: string): {
         id: string;
         session: CanonicalSession;
@@ -78,7 +91,7 @@ export declare class CampStore {
         modelDigest: string;
         vector: number[];
     }): void;
-    semanticVectors(projectId: string, modelDigest: string, source?: "raw" | "curated" | "all"): Iterable<SemanticVectorRow>;
+    semanticVectors(projectId: string, modelDigest: string, source?: "raw" | "curated" | "all", limit?: number): Iterable<SemanticVectorRow>;
     searchHitByDocument(projectId: string, layer: "raw" | "curated", id: string, score: number): SearchHit | null;
     addQuarantine(input: {
         projectId?: string | null;
@@ -108,6 +121,44 @@ export declare class CampStore {
     verifyMigration(projectId: string, backend: string, expectedHashes: string[], completedHashes: string[]): boolean;
     migrationAudit(projectId: string, backend?: string): Record<string, unknown> | null;
     projectStatus(projectId: string): ProjectStatus;
+    beginSourceSync(projectId: string, source: AgentSource): string;
+    projectSyncInProgress(projectId: string): boolean;
+    recoverInterruptedSyncs(): number;
+    finishSourceSync(runId: string, projectId: string, summary: {
+        source: AgentSource;
+        scanned: number;
+        imported: number;
+        replaced: number;
+        skipped: number;
+        quarantined: number;
+        errors: string[];
+        errorDetails?: ImportErrorDetail[];
+    }): void;
+    sourceFreshness(projectId: string): SourceFreshness[];
+    putContextReceipt(receipt: ContextReceipt, challengeHash: string): void;
+    contextReceipt(id: string): {
+        receipt: ContextReceipt;
+        challengeHash: string;
+        acknowledgedAt: string | null;
+    } | null;
+    contextAcknowledgment(receiptId: string): ContextAcknowledgment | null;
+    putContextAcknowledgment(acknowledgment: ContextAcknowledgment): void;
+    createVerificationRun(input: {
+        project: ProjectRegistration;
+        sourceAgent: AgentSource;
+        sourceSurface: VerificationRun["sourceSurface"];
+        sourceClient: VerificationRun["sourceClient"];
+        targetAgents: AgentSource[];
+        ttlSeconds: number;
+        canary: string;
+    }): VerificationRun;
+    verificationRun(id: string): VerificationRun | null;
+    refreshVerificationRun(id: string): VerificationRun | null;
+    refreshProjectVerificationRuns(projectId: string): VerificationRun[];
+    verificationSearchHits(run: VerificationRun): SearchHit[];
+    verificationAcknowledgments(runId: string): ContextAcknowledgment[];
+    setVerificationStatus(id: string, status: VerificationRun["status"]): void;
+    cancelVerificationRun(id: string): VerificationRun | null;
     recordHealth(projectId: string, component: string, status: "ok" | "degraded", detail: string): void;
     unregisterProject(projectId: string, purge: boolean): void;
     sourceFileInfo(path: string): {

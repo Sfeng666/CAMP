@@ -1,6 +1,6 @@
 import type { ProjectRegistration, SearchHit } from "./types.js";
 import type { CampStore } from "./store.js";
-export declare function syncSemanticIndex(store: CampStore, project: ProjectRegistration, limit?: number): Promise<{
+export declare function syncSemanticIndex(store: CampStore, project: ProjectRegistration, limit?: number, cooperate?: () => Promise<void>): Promise<{
     indexed: number;
     pending: number;
     degraded: boolean;

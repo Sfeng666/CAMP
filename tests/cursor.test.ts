@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { mkdirSync, readFileSync, statSync, truncateSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, statSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { isolatedCamp, type IsolatedCamp } from "./helpers.js";
@@ -100,6 +100,10 @@ describe("Cursor transcript bridge", () => {
     expect(result.imported).toBe(0);
     expect(result.quarantined).toBe(1);
     expect(store.listQuarantine(project.id)[0]?.reason).toMatch(/Unknown Cursor bubble schema/);
+
+    const unchanged = await importCursor(store, project, cursorRoot);
+    expect(unchanged.skipped).toBe(1);
+    expect(unchanged.quarantined).toBe(0);
   });
 
   it("imports modern global composer headers and quarantines sibling-project sessions", async () => {
@@ -188,7 +192,160 @@ describe("Cursor transcript bridge", () => {
     const session = store.getSession(store.listSessionIds(project.id)[0] ?? "", project.id);
     expect(session?.sourceVersion).toBe("cursor-vscdb@2");
     expect(session?.messages.map((item) => item.role)).toEqual(["user", "assistant"]);
-    expect(store.listQuarantine(project.id)[0]?.reason).toMatch(/spans sibling Git repositories/);
+    const quarantine = store.listQuarantine(project.id)[0];
+    expect(quarantine?.reason).toMatch(/spans sibling Git repositories/);
+
+    const unchanged = await importCursor(store, project, cursorRoot);
+    expect(unchanged.skipped).toBe(2);
+    expect(unchanged.quarantined).toBe(0);
+
+    const changedDb = new Database(globalPath);
+    changedDb
+      .prepare("UPDATE composerHeaders SET lastUpdatedAt = ? WHERE composerId = ?")
+      .run(5, "modern-exact");
+    changedDb
+      .prepare("UPDATE cursorDiskKV SET value = ? WHERE [key] = ?")
+      .run(
+        JSON.stringify({
+          _v: 3,
+          bubbleId: "a-assistant",
+          type: 2,
+          text: "Modern Cursor response updated",
+          createdAt: "2026-01-01T00:00:02Z",
+        }),
+        "bubbleId:modern-exact:a-assistant",
+      );
+    changedDb.close();
+    const changed = await importCursor(store, project, cursorRoot);
+    expect(changed.replaced).toBe(1);
+    expect(store.search(project.id, "response updated", "raw")).toHaveLength(1);
+
+    expect(store.resolveQuarantine(String(quarantine?.id), project.id)).toBe(true);
+    const assigned = await importCursor(store, project, cursorRoot);
+    expect(assigned.imported).toBe(1);
+  });
+
+  it("never falls back to unrelated global composer headers", async () => {
+    const projectRoot = join(env.root, "project");
+    const otherRoot = join(env.root, "other-project");
+    mkdirSync(projectRoot);
+    mkdirSync(otherRoot);
+    const project = setupProject(store, projectRoot);
+    const cursorRoot = join(env.root, "cursor-user");
+    const global = join(cursorRoot, "globalStorage");
+    mkdirSync(global, { recursive: true });
+    const db = new Database(join(global, "state.vscdb"));
+    db.exec(`
+      CREATE TABLE cursorDiskKV ([key] TEXT PRIMARY KEY, value TEXT);
+      CREATE TABLE composerHeaders (
+        composerId TEXT PRIMARY KEY,
+        workspaceId TEXT,
+        createdAt INTEGER,
+        lastUpdatedAt INTEGER,
+        value TEXT
+      );
+    `);
+    db.prepare("INSERT INTO composerHeaders(composerId, workspaceId, createdAt, lastUpdatedAt, value) VALUES (?, ?, ?, ?, ?)")
+      .run(
+        "other-only",
+        "other",
+        1,
+        2,
+        JSON.stringify({
+          type: "head",
+          trackedGitRepos: [{ repoPath: otherRoot }],
+          workspaceIdentifier: { uri: { fsPath: otherRoot } },
+        }),
+      );
+    db.prepare("INSERT INTO cursorDiskKV([key], value) VALUES (?, ?)")
+      .run(
+        "bubbleId:other-only:assistant",
+        JSON.stringify({ _v: 3, bubbleId: "assistant", type: 2, text: "Do not import this project", createdAt: 1 }),
+      );
+    db.close();
+
+    const result = await importCursor(store, project, cursorRoot);
+    expect(result.scanned).toBe(0);
+    expect(result.imported).toBe(0);
+    expect(store.listSessionIds(project.id)).toEqual([]);
+    expect(store.listQuarantine(project.id)).toEqual([]);
+  });
+
+  it("quarantines legacy Cursor composers from a parent workspace even with a child-path mention", async () => {
+    const parent = join(env.root, "parent-workspace");
+    const projectRoot = join(parent, "project");
+    mkdirSync(projectRoot, { recursive: true });
+    const project = setupProject(store, projectRoot);
+    const cursorRoot = join(env.root, "cursor-user");
+    const workspace = join(cursorRoot, "workspaceStorage", "parent");
+    const global = join(cursorRoot, "globalStorage");
+    mkdirSync(workspace, { recursive: true });
+    mkdirSync(global, { recursive: true });
+    writeFileSync(join(workspace, "workspace.json"), JSON.stringify({ folder: `file://${parent}` }));
+    const workspaceDb = new Database(join(workspace, "state.vscdb"));
+    workspaceDb.exec("CREATE TABLE ItemTable ([key] TEXT PRIMARY KEY, value TEXT)");
+    workspaceDb.prepare("INSERT INTO ItemTable([key], value) VALUES (?, ?)").run(
+      "composer.composerData",
+      JSON.stringify({ allComposers: [{ composerId: "parent-composer", name: "Parent workspace" }] }),
+    );
+    workspaceDb.close();
+    const globalDb = new Database(join(global, "state.vscdb"));
+    globalDb.exec("CREATE TABLE cursorDiskKV ([key] TEXT PRIMARY KEY, value TEXT)");
+    globalDb.prepare("INSERT INTO cursorDiskKV([key], value) VALUES (?, ?)").run(
+      "bubbleId:parent-composer:assistant",
+      JSON.stringify({
+        _v: 3,
+        bubbleId: "assistant",
+        type: 2,
+        text: `This mentions ${project.rootPath} but was opened from the parent workspace`,
+        createdAt: 1,
+      }),
+    );
+    globalDb.close();
+
+    const first = await importCursor(store, project, cursorRoot);
+    expect(first.imported).toBe(0);
+    expect(first.quarantined).toBe(1);
+    expect(store.listQuarantine(project.id)[0]?.reason).toMatch(/parent workspace/);
+
+    const quarantine = store.listQuarantine(project.id)[0];
+    expect(store.resolveQuarantine(String(quarantine?.id), project.id)).toBe(true);
+    const assigned = await importCursor(store, project, cursorRoot);
+    expect(assigned.imported).toBe(1);
+  });
+
+  it("ignores remote Cursor workspace URIs instead of resolving them under the local project", async () => {
+    const projectRoot = join(env.root, "project");
+    mkdirSync(projectRoot);
+    const project = setupProject(store, projectRoot);
+    const cursorRoot = join(env.root, "cursor-user");
+    const workspace = join(cursorRoot, "workspaceStorage", "remote");
+    const global = join(cursorRoot, "globalStorage");
+    mkdirSync(workspace, { recursive: true });
+    mkdirSync(global, { recursive: true });
+    writeFileSync(
+      join(workspace, "workspace.json"),
+      JSON.stringify({ folder: "vscode-remote://ssh-remote%2Bexample/home/user/project" }),
+    );
+    const workspaceDb = new Database(join(workspace, "state.vscdb"));
+    workspaceDb.exec("CREATE TABLE ItemTable ([key] TEXT PRIMARY KEY, value TEXT)");
+    workspaceDb.prepare("INSERT INTO ItemTable([key], value) VALUES (?, ?)").run(
+      "composer.composerData",
+      JSON.stringify({ allComposers: [{ composerId: "remote-composer" }] }),
+    );
+    workspaceDb.close();
+    const globalDb = new Database(join(global, "state.vscdb"));
+    globalDb.exec("CREATE TABLE cursorDiskKV ([key] TEXT PRIMARY KEY, value TEXT)");
+    globalDb.prepare("INSERT INTO cursorDiskKV([key], value) VALUES (?, ?)").run(
+      "bubbleId:remote-composer:assistant",
+      JSON.stringify({ _v: 3, bubbleId: "assistant", type: 2, text: project.rootPath, createdAt: 1 }),
+    );
+    globalDb.close();
+
+    const result = await importCursor(store, project, cursorRoot);
+    expect(result.scanned).toBe(0);
+    expect(result.imported).toBe(0);
+    expect(store.listSessionIds(project.id)).toEqual([]);
   });
 
   it("does not scale RSS with a sparse multi-gigabyte Cursor database fixture", async () => {
@@ -230,5 +387,52 @@ describe("Cursor transcript bridge", () => {
     const session = store.getSession(store.listSessionIds(project.id)[0] ?? "", project.id);
     expect(session?.surface).toBe("cli");
     expect(session?.sourceVersion).toBe("cursor-agent-transcript@1");
+  });
+
+  it("imports a Cursor CLI transcript written with a symlinked workspace spelling", async () => {
+    const physicalRoot = join(env.root, "physical-project");
+    const openedRoot = join(env.root, "opened-project");
+    mkdirSync(physicalRoot);
+    symlinkSync(physicalRoot, openedRoot, "dir");
+    const project = setupProject(store, openedRoot);
+    expect(project.activePaths).toContain(openedRoot);
+
+    const projects = join(env.root, "cursor-projects");
+    const encoded = openedRoot.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+    const transcript = join(projects, encoded, "agent-transcripts", "chat-symlink", "chat-symlink.jsonl");
+    mkdirSync(join(projects, encoded, "agent-transcripts", "chat-symlink"), { recursive: true });
+    writeFileSync(
+      transcript,
+      [
+        JSON.stringify({ role: "user", message: "Remember the linked workspace" }),
+        JSON.stringify({ role: "assistant", message: "Cursor Agent CLI symlink transcript imported" }),
+      ].join("\n"),
+    );
+    process.env.CURSOR_PROJECTS_DIR = projects;
+
+    const result = await importCursor(store, project, join(env.root, "no-cursor-ide"));
+    expect(result.imported).toBe(1);
+    const session = store.getSession(store.listSessionIds(project.id)[0] ?? "", project.id);
+    expect(session?.surface).toBe("cli");
+    expect(session?.messages.map((entry) => entry.content).join("\n")).toContain("linked workspace");
+  });
+
+  it("imports a Cursor CLI transcript when Cursor flattens punctuation in the workspace path", async () => {
+    const projectRoot = join(env.root, "project.v1");
+    mkdirSync(projectRoot);
+    const project = setupProject(store, projectRoot);
+    const projects = join(env.root, "cursor-projects");
+    const encoded = project.rootPath.replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+    const transcript = join(projects, encoded, "agent-transcripts", "chat-dot", "chat-dot.jsonl");
+    mkdirSync(join(projects, encoded, "agent-transcripts", "chat-dot"), { recursive: true });
+    writeFileSync(
+      transcript,
+      `${JSON.stringify({ role: "user", message: "Remember punctuation-safe workspace matching" })}\n`,
+    );
+    process.env.CURSOR_PROJECTS_DIR = projects;
+
+    const result = await importCursor(store, project, join(env.root, "no-cursor-ide"));
+    expect(result.imported).toBe(1);
+    expect(store.getSession(store.listSessionIds(project.id)[0] ?? "", project.id)?.surface).toBe("cli");
   });
 });

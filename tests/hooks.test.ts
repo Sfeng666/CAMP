@@ -120,6 +120,46 @@ describe("bounded automatic recall and handoff", () => {
     expect(await createAutomaticHandoff(store, project)).toBeNull();
   });
 
+  it("does not replace project state with a CAMP receipt-verification prompt", async () => {
+    const root = join(env.root, "project");
+    mkdirSync(root);
+    const project = setupProject(store, root);
+    const sourcePath = join(root, "receipt-session.jsonl");
+    writeFileSync(sourcePath, "{}\n");
+    store.storeSession({
+      schemaVersion: SCHEMA_VERSION,
+      source: "codex",
+      nativeId: "receipt-session",
+      projectId: project.id,
+      projectRoot: project.rootPath,
+      cwd: project.rootPath,
+      sourcePath,
+      sourceFingerprint: "receipt-fixture",
+      startedAt: "2026-01-01T00:00:00.000Z",
+      endedAt: "2026-01-01T00:01:00.000Z",
+      messages: [
+        {
+          id: "u1",
+          sequence: 0,
+          role: "user",
+          kind: "message",
+          content: "Verify CAMP context, call camp_context_for_task, and acknowledge the exact receipt.",
+          timestamp: "2026-01-01T00:00:00.000Z",
+        },
+        {
+          id: "a1",
+          sequence: 1,
+          role: "assistant",
+          kind: "message",
+          content: "The receipt was acknowledged.",
+          timestamp: "2026-01-01T00:01:00.000Z",
+        },
+      ],
+    });
+    expect(await createAutomaticHandoff(store, project)).toBeNull();
+    expect(store.latestHandoff(project.id)).toBeNull();
+  });
+
   it("prefers a project-authored status handoff and labels its validation historical", async () => {
     const root = join(env.root, "project");
     const summary = join(root, "codex_summary");

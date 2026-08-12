@@ -8,6 +8,7 @@ import {
   canonicalSession,
   message,
   projectMatch,
+  readJsonLinePrefix,
   readJsonLines,
   timestamp,
   walkFiles,
@@ -17,6 +18,24 @@ interface ParsedCodex {
   nativeId: string;
   cwd: string | null;
   messages: CanonicalMessage[];
+}
+
+async function parseCodexMetadata(path: string): Promise<Pick<ParsedCodex, "nativeId" | "cwd">> {
+  let nativeId = basename(path, ".jsonl");
+  let cwd: string | null = null;
+  for (const { value: entry } of await readJsonLinePrefix(path)) {
+    const payload = (entry.payload && typeof entry.payload === "object"
+      ? entry.payload
+      : {}) as Record<string, unknown>;
+    if (entry.type === "session_meta") {
+      if (typeof payload.id === "string") nativeId = payload.id;
+      if (typeof payload.cwd === "string") cwd = payload.cwd;
+    } else if (entry.type === "turn_context" && typeof payload.cwd === "string") {
+      cwd = payload.cwd;
+    }
+    if (cwd && nativeId !== basename(path, ".jsonl")) break;
+  }
+  return { nativeId, cwd };
 }
 
 function extractCodexMessage(
@@ -74,7 +93,10 @@ function extractCodexMessage(
   return null;
 }
 
-export async function parseCodexFile(path: string): Promise<ParsedCodex> {
+export async function parseCodexFile(
+  path: string,
+  cooperate: () => Promise<void> = async () => undefined,
+): Promise<ParsedCodex> {
   let nativeId = basename(path, ".jsonl");
   let cwd: string | null = null;
   const messages: CanonicalMessage[] = [];
@@ -91,7 +113,7 @@ export async function parseCodexFile(path: string): Promise<ParsedCodex> {
     if (entry.type !== "response_item" && entry.type !== "event_msg") return;
     const extracted = extractCodexMessage(entry, messages.length, sourceLine);
     if (extracted) messages.push(extracted);
-  });
+  }, cooperate);
   return { nativeId, cwd, messages };
 }
 
@@ -99,6 +121,7 @@ async function importCodexSummary(
   store: CampStore,
   project: ProjectRegistration,
   summary: ImportSummary,
+  cooperate: () => Promise<void> = async () => undefined,
 ): Promise<void> {
   const candidates = [
     resolve(project.rootPath, "codex_summary", "chat_history", "project_chat_history.jsonl"),
@@ -107,6 +130,12 @@ async function importCodexSummary(
   for (const path of candidates) {
     if (!existsSync(path)) continue;
     summary.scanned += 1;
+    const checkpointKey = stableId("codex-summary", path);
+    const fingerprint = fileFingerprint(path);
+    if (store.checkpoint(project.id, "archive", checkpointKey) === fingerprint) {
+      summary.skipped += 1;
+      continue;
+    }
     const grouped = new Map<string, CanonicalMessage[]>();
     await readJsonLines(path, (entry, line) => {
       const sessionId = String(
@@ -126,7 +155,7 @@ async function importCodexSummary(
       });
       if (item) list.push(item);
       grouped.set(sessionId, list);
-    });
+    }, cooperate);
     for (const [nativeId, messages] of grouped) {
       if (!messages.length) continue;
     const session = await canonicalSession({
@@ -140,9 +169,10 @@ async function importCodexSummary(
         messages,
         metadata: { source: "codex_summary" },
       });
-      const result = store.storeSession(session);
+      const result = await store.storeSessionAsync(session, cooperate);
       summary[result.status] += 1;
     }
+    store.setCheckpoint(project.id, "archive", checkpointKey, fingerprint);
   }
 }
 
@@ -150,6 +180,7 @@ export async function importCodex(
   store: CampStore,
   project: ProjectRegistration,
   root = process.env.CODEX_SESSIONS_DIR ?? join(userHome(), ".codex", "sessions"),
+  cooperate: () => Promise<void> = async () => undefined,
 ): Promise<ImportSummary> {
   const summary: ImportSummary = {
     source: "codex",
@@ -170,9 +201,40 @@ export async function importCodex(
         summary.skipped += 1;
         continue;
       }
-      const parsed = await parseCodexFile(path);
+      const metadata = await parseCodexMetadata(path);
+      const preflightMatch = projectMatch(metadata.cwd, project);
+      if (preflightMatch === "unrelated") {
+        store.setCheckpoint(project.id, "codex", checkpointKey, fingerprint);
+        continue;
+      }
+      const preflightAssigned = store.isSourceAssigned(
+        "codex",
+        path,
+        metadata.nativeId,
+        project.id,
+      );
+      if (preflightMatch === "parent" && !preflightAssigned) {
+        store.addQuarantine({
+          projectId: project.id,
+          source: "codex",
+          sourcePath: path,
+          nativeId: metadata.nativeId,
+          reason: "Codex session is attached to a parent workspace; explicit project assignment is required",
+          metadata: { cwd: metadata.cwd, preflightOnly: true },
+        });
+        store.setCheckpoint(project.id, "codex", checkpointKey, fingerprint);
+        summary.quarantined += 1;
+        continue;
+      }
+      const parsed = await parseCodexFile(path, cooperate);
       const match = projectMatch(parsed.cwd, project);
-      if (match === "unrelated") continue;
+      if (match === "unrelated") {
+        // Remember negative project attribution too. Without this checkpoint,
+        // every registered project reparses every unrelated historical JSONL
+        // on every poll.
+        store.setCheckpoint(project.id, "codex", checkpointKey, fingerprint);
+        continue;
+      }
       const assigned = store.isSourceAssigned(
         "codex",
         path,
@@ -189,11 +251,20 @@ export async function importCodex(
             reason: "Codex session is attached to a parent workspace; explicit project assignment is required",
             metadata: { cwd: parsed.cwd, messages: parsed.messages.length },
           });
+          store.setCheckpoint(project.id, "codex", checkpointKey, fingerprint);
           summary.quarantined += 1;
+        }
+        if (match === "unknown") {
+          // An unchanged file cannot acquire workspace evidence; appending
+          // later changes its fingerprint and causes a safe retry.
+          store.setCheckpoint(project.id, "codex", checkpointKey, fingerprint);
         }
         continue;
       }
-      if (!parsed.messages.length) continue;
+      if (!parsed.messages.length) {
+        store.setCheckpoint(project.id, "codex", checkpointKey, fingerprint);
+        continue;
+      }
     const session = await canonicalSession({
       source: "codex",
       surface: "cli",
@@ -204,13 +275,16 @@ export async function importCodex(
         sourcePath: path,
         messages: parsed.messages,
       });
-      const result = store.storeSession(session);
+      const result = await store.storeSessionAsync(session, cooperate);
       summary[result.status] += 1;
       store.setCheckpoint(project.id, "codex", checkpointKey, fingerprint);
     } catch (error) {
       summary.errors.push(`${path}: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      await cooperate();
     }
   }
-  await importCodexSummary(store, project, summary);
+  await importCodexSummary(store, project, summary, cooperate);
+  await cooperate();
   return summary;
 }

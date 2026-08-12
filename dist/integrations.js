@@ -7,11 +7,17 @@ import { atomicWrite, nowIso, readJsonFile, sha256, stableId } from "./utils.js"
 import { ensurePrivateFile } from "./paths.js";
 import { CAMP_LICENSE, CAMP_VERSION } from "./version.js";
 import { commandString, findCommand, hostPlatform, userHome } from "./platform.js";
+const AUTO_APPROVED_CAMP_TOOLS = [
+    "camp_context_for_task",
+    "camp_ack_context",
+    "camp_start_verification",
+];
 function commandPath(command) {
     return findCommand(command);
 }
 export function detectClients() {
     const home = userHome();
+    const cursorCliConfig = join(home, ".cursor", "cli-config.json");
     const detections = [
         {
             name: "codex",
@@ -24,7 +30,10 @@ export function detectClients() {
             installed: Boolean(commandPath("cursor") || commandPath("cursor-agent") || existsSync(join(home, ".cursor"))),
             detail: commandPath("cursor-agent") ?? commandPath("cursor") ?? join(home, ".cursor"),
             surfaces: [
-                ...(commandPath("cursor-agent") ? ["cli"] : []),
+                // A persisted Cursor CLI policy is evidence that this user has used
+                // the CLI, even when its executable is not on the current PATH. This
+                // matters for a new login shell and for `camp init` on CI hosts.
+                ...(commandPath("cursor-agent") || existsSync(cursorCliConfig) ? ["cli"] : []),
                 ...(commandPath("cursor") || existsSync(join(home, ".cursor")) ? ["ide"] : []),
             ],
         },
@@ -132,6 +141,61 @@ function installJson(store, client, path, invocation) {
         detail: "Registered the CAMP composite MCP server without replacing other servers",
     };
 }
+/**
+ * Merge a small, explicit string allowlist without replacing unrelated user
+ * policy. The manifest records only CAMP's values so removal can subtract
+ * those values while preserving later user additions.
+ */
+function installJsonStringArray(store, client, path, fieldPath, values, detail, defaults = {}) {
+    let current = { ...defaults };
+    const existed = existsSync(path);
+    if (existed) {
+        try {
+            current = JSON.parse(readFileSync(path, "utf8"));
+        }
+        catch {
+            return { client, status: "error", path, detail: "Existing permission JSON is invalid; CAMP left it untouched" };
+        }
+    }
+    let owner = current;
+    for (const field of fieldPath.slice(0, -1)) {
+        const prior = owner[field];
+        if (prior !== undefined && (prior === null || typeof prior !== "object" || Array.isArray(prior))) {
+            return { client, status: "error", path, detail: `Permission field ${fieldPath.join(".")} is not an object; CAMP left it untouched` };
+        }
+        if (!prior)
+            owner[field] = {};
+        owner = owner[field];
+    }
+    const field = fieldPath.at(-1);
+    if (!field)
+        throw new Error("Permission array path must not be empty");
+    const priorValues = owner[field];
+    if (priorValues !== undefined && !Array.isArray(priorValues)) {
+        return { client, status: "error", path, detail: `Permission field ${fieldPath.join(".")} is not an array; CAMP left it untouched` };
+    }
+    const existingValues = (priorValues ?? []).filter((value) => typeof value === "string");
+    const merged = Array.from(new Set([...existingValues, ...values]));
+    owner[field] = merged;
+    const content = `${JSON.stringify(current, null, 2)}\n`;
+    const oldBackup = backup(store, path);
+    atomicWrite(path, content);
+    const manifest = readManifest(store);
+    const priorManifest = manifest.entries.find((item) => item.client === client && item.path === path);
+    manifest.entries = manifest.entries.filter((item) => !(item.client === client && item.path === path));
+    manifest.entries.push({
+        client,
+        path,
+        format: "json-string-array",
+        backupPath: priorManifest ? priorManifest.backupPath : oldBackup.path,
+        originalHash: priorManifest ? priorManifest.originalHash : oldBackup.hash,
+        installedHash: sha256(content),
+        installedEntry: { fieldPath, values },
+        updatedAt: nowIso(),
+    });
+    writeManifest(store, manifest);
+    return { client, status: existed ? "updated" : "installed", path, detail };
+}
 function hookCommand(invocation, agent, event) {
     const args = [...invocation.args.slice(0, -1), "capture", "--agent", agent, "--event", event];
     return commandString(invocation.command, args);
@@ -155,9 +219,15 @@ function installClaudeHooks(store, path, invocation) {
     }
     const manifest = readManifest(store);
     const prior = manifest.entries.find((item) => item.client === "claude" && item.path === path && item.format === "json-hooks");
-    const priorEntries = prior?.installedEntry && typeof prior.installedEntry === "object"
+    const priorOwned = prior?.installedEntry && typeof prior.installedEntry === "object"
         ? prior.installedEntry
         : {};
+    const priorEntries = priorOwned.__campHooks && typeof priorOwned.__campHooks === "object"
+        ? priorOwned.__campHooks
+        : priorOwned;
+    const priorPermissionValues = Array.isArray(priorOwned.__campPermissionAllow)
+        ? priorOwned.__campPermissionAllow.filter((value) => typeof value === "string")
+        : [];
     const hooks = current.hooks && typeof current.hooks === "object" && !Array.isArray(current.hooks)
         ? { ...current.hooks }
         : {};
@@ -173,7 +243,21 @@ function installClaudeHooks(store, path, invocation) {
         hooks[event] = filtered;
         installedEntries[event] = entry;
     }
-    const next = `${JSON.stringify({ ...current, hooks }, null, 2)}\n`;
+    if (current.permissions !== undefined &&
+        (current.permissions === null || typeof current.permissions !== "object" || Array.isArray(current.permissions))) {
+        return { client: "claude", status: "error", path, detail: "Claude permissions is not an object; CAMP left it untouched" };
+    }
+    const permissions = current.permissions && typeof current.permissions === "object" && !Array.isArray(current.permissions)
+        ? { ...current.permissions }
+        : {};
+    if (permissions.allow !== undefined && !Array.isArray(permissions.allow)) {
+        return { client: "claude", status: "error", path, detail: "Claude permissions.allow is not an array; CAMP left it untouched" };
+    }
+    const previousAllow = (permissions.allow ?? []).filter((value) => typeof value === "string");
+    const withoutPrior = previousAllow.filter((value) => !priorPermissionValues.includes(value));
+    const permissionValues = AUTO_APPROVED_CAMP_TOOLS.map((tool) => `mcp__camp__${tool}`);
+    permissions.allow = Array.from(new Set([...withoutPrior, ...permissionValues]));
+    const next = `${JSON.stringify({ ...current, hooks, permissions }, null, 2)}\n`;
     const oldBackup = backup(store, path);
     atomicWrite(path, next);
     trackInstall(store, {
@@ -183,10 +267,13 @@ function installClaudeHooks(store, path, invocation) {
         backupPath: oldBackup.path,
         originalHash: oldBackup.hash,
         installedHash: sha256(next),
-        installedEntry: installedEntries,
+        installedEntry: {
+            __campHooks: installedEntries,
+            __campPermissionAllow: permissionValues,
+        },
         updatedAt: nowIso(),
     });
-    return { client: "claude", status: prior ? "updated" : "installed", path, detail: "Merged CAMP lifecycle hooks into Claude settings" };
+    return { client: "claude", status: prior ? "updated" : "installed", path, detail: "Merged CAMP lifecycle hooks and only the three context receipt approvals into Claude settings" };
 }
 function installOwnedJson(store, client, path, value) {
     const content = `${JSON.stringify(value, null, 2)}\n`;
@@ -341,6 +428,23 @@ function installCodexToml(store, path, invocation) {
         "[mcp_servers.camp]",
         `command = ${tomlString(invocation.command)}`,
         `args = [${args}]`,
+        "startup_timeout_sec = 30",
+        "tool_timeout_sec = 180",
+        "required = true",
+        // Read-only tools run without a prompt based on their truthful MCP
+        // annotations. Curated-memory and handoff writes remain approval-gated.
+        // Only the bounded audit/canary flow is pre-approved so non-interactive
+        // receipt validation cannot be auto-rejected as `user cancelled`.
+        'default_tools_approval_mode = "writes"',
+        "",
+        "[mcp_servers.camp.tools.camp_context_for_task]",
+        'approval_mode = "approve"',
+        "",
+        "[mcp_servers.camp.tools.camp_ack_context]",
+        'approval_mode = "approve"',
+        "",
+        "[mcp_servers.camp.tools.camp_start_verification]",
+        'approval_mode = "approve"',
         TOML_END,
     ].join("\n");
     const pattern = new RegExp(`${TOML_START.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[\\s\\S]*?${TOML_END.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`, "m");
@@ -384,7 +488,19 @@ export function installIntegrations(store) {
         results.push({ client: "codex", status: "pending", path: null, detail: "Codex is not installed" });
     }
     if (detected.get("cursor")?.installed) {
-        results.push(installJson(store, "cursor", join(home, ".cursor", "mcp.json"), invocation));
+        const result = installJson(store, "cursor", join(home, ".cursor", "mcp.json"), invocation);
+        const cursor = detected.get("cursor");
+        const approvalResults = [];
+        if (cursor.surfaces.includes("ide")) {
+            approvalResults.push(installJsonStringArray(store, "cursor", join(home, ".cursor", "permissions.json"), ["mcpAllowlist"], AUTO_APPROVED_CAMP_TOOLS.map((tool) => `camp:${tool}`), "Allowed only CAMP context receipt and verification tools in Cursor IDE"));
+        }
+        if (cursor.surfaces.includes("cli")) {
+            approvalResults.push(installJsonStringArray(store, "cursor", join(home, ".cursor", "cli-config.json"), ["permissions", "allow"], AUTO_APPROVED_CAMP_TOOLS.map((tool) => `Mcp(camp:${tool})`), "Allowed only CAMP context receipt and verification tools in Cursor CLI", { version: 1, editor: { vimMode: false }, permissions: { allow: [], deny: [] } }));
+        }
+        result.detail = `${result.detail}; ${approvalResults.map((item) => item.detail).join("; ")}`;
+        if (approvalResults.some((item) => item.status === "error"))
+            result.status = "error";
+        results.push(result);
     }
     else {
         results.push({ client: "cursor", status: "pending", path: null, detail: "Cursor is not installed" });
@@ -403,7 +519,10 @@ export function installIntegrations(store) {
     if (detected.get("antigravity")?.installed) {
         const primary = join(home, ".gemini", "config", "mcp_config.json");
         const result = installJson(store, "antigravity", primary, invocation);
-        result.detail = `${result.detail}; ${installAntigravityHookPlugin(store, invocation)}`;
+        const approval = installJsonStringArray(store, "antigravity", join(home, ".gemini", "antigravity-cli", "settings.json"), ["permissions", "allow"], AUTO_APPROVED_CAMP_TOOLS.map((tool) => `mcp(camp/${tool})`), "Allowed only CAMP context receipt and verification tools in Antigravity CLI");
+        result.detail = `${result.detail}; ${installAntigravityHookPlugin(store, invocation)}; ${approval.detail}; Antigravity desktop permissions remain client-controlled`;
+        if (approval.status === "error")
+            result.status = "error";
         results.push(result);
     }
     else {
@@ -465,12 +584,26 @@ export function removeIntegrations(store) {
             continue;
         }
         if (item.format === "json-hooks") {
+            if (sha256(current) === item.installedHash) {
+                if (item.backupPath && existsSync(item.backupPath))
+                    atomicWrite(item.path, readFileSync(item.backupPath));
+                else
+                    unlinkSync(item.path);
+                results.push({ client: item.client, status: "updated", path: item.path, detail: "Restored the exact pre-CAMP hook and permission configuration" });
+                continue;
+            }
             try {
                 const parsed = JSON.parse(current);
                 const hooks = parsed.hooks && typeof parsed.hooks === "object" && !Array.isArray(parsed.hooks)
                     ? parsed.hooks
                     : {};
-                const owned = item.installedEntry;
+                const rawOwned = item.installedEntry;
+                const owned = rawOwned.__campHooks && typeof rawOwned.__campHooks === "object"
+                    ? rawOwned.__campHooks
+                    : rawOwned;
+                const permissionValues = Array.isArray(rawOwned.__campPermissionAllow)
+                    ? rawOwned.__campPermissionAllow.filter((value) => typeof value === "string")
+                    : [];
                 let conflict = false;
                 for (const [event, entry] of Object.entries(owned)) {
                     const entries = Array.isArray(hooks[event]) ? [...hooks[event]] : [];
@@ -485,13 +618,33 @@ export function removeIntegrations(store) {
                     else
                         delete hooks[event];
                 }
+                let permissions = parsed.permissions && typeof parsed.permissions === "object" && !Array.isArray(parsed.permissions)
+                    ? { ...parsed.permissions }
+                    : null;
+                if (permissionValues.length) {
+                    const allow = permissions && Array.isArray(permissions.allow)
+                        ? [...permissions.allow]
+                        : [];
+                    for (const value of permissionValues) {
+                        const index = allow.findIndex((candidate) => candidate === value);
+                        if (index < 0)
+                            conflict = true;
+                        else
+                            allow.splice(index, 1);
+                    }
+                    if (permissions)
+                        permissions.allow = allow;
+                }
                 if (conflict) {
                     retained.push(item);
                     results.push({ client: item.client, status: "error", path: item.path, detail: "A CAMP hook entry was edited; conflicting entries were preserved" });
                     continue;
                 }
-                const next = { ...parsed, hooks };
-                if (item.originalHash === null && Object.keys(hooks).length === 0 && Object.keys(next).every((key) => key === "hooks")) {
+                const next = { ...parsed, hooks, ...(permissions ? { permissions } : {}) };
+                if (item.originalHash === null &&
+                    Object.keys(hooks).length === 0 &&
+                    (!permissions || Object.values(permissions).every((value) => Array.isArray(value) && value.length === 0)) &&
+                    Object.keys(next).every((key) => key === "hooks" || key === "permissions")) {
                     unlinkSync(item.path);
                 }
                 else {
@@ -502,6 +655,52 @@ export function removeIntegrations(store) {
             catch {
                 retained.push(item);
                 results.push({ client: item.client, status: "error", path: item.path, detail: "Hook configuration is no longer valid JSON" });
+            }
+            continue;
+        }
+        if (item.format === "json-string-array") {
+            if (sha256(current) === item.installedHash) {
+                if (item.backupPath && existsSync(item.backupPath))
+                    atomicWrite(item.path, readFileSync(item.backupPath));
+                else
+                    unlinkSync(item.path);
+                results.push({ client: item.client, status: "updated", path: item.path, detail: "Restored the exact pre-CAMP permission configuration" });
+                continue;
+            }
+            try {
+                const parsed = JSON.parse(current);
+                const owned = item.installedEntry;
+                let owner = parsed;
+                for (const field of owned.fieldPath.slice(0, -1)) {
+                    const nested = owner ? owner[field] : undefined;
+                    owner = nested && typeof nested === "object" && !Array.isArray(nested)
+                        ? nested
+                        : null;
+                }
+                const field = owned.fieldPath.at(-1);
+                const entries = owner && field && Array.isArray(owner[field]) ? [...owner[field]] : null;
+                if (!owner || !field || !entries || owned.values.some((value) => !entries.includes(value))) {
+                    retained.push(item);
+                    results.push({ client: item.client, status: "error", path: item.path, detail: "A CAMP permission entry was edited; conflicting policy was preserved" });
+                    continue;
+                }
+                owner[field] = entries.filter((value) => !owned.values.includes(String(value)));
+                const semanticallyEmpty = (value) => {
+                    if (Array.isArray(value))
+                        return value.length === 0;
+                    if (!value || typeof value !== "object")
+                        return false;
+                    return Object.values(value).every(semanticallyEmpty);
+                };
+                if (item.originalHash === null && semanticallyEmpty(parsed))
+                    unlinkSync(item.path);
+                else
+                    atomicWrite(item.path, `${JSON.stringify(parsed, null, 2)}\n`);
+                results.push({ client: item.client, status: "updated", path: item.path, detail: "Removed unchanged CAMP permission entries" });
+            }
+            catch {
+                retained.push(item);
+                results.push({ client: item.client, status: "error", path: item.path, detail: "Permission configuration is no longer valid JSON" });
             }
             continue;
         }
@@ -591,19 +790,35 @@ ${xmlArgs}
   </dict>
 </plist>
 `;
-    atomicWrite(path, plist, 0o600);
+    const unchanged = existsSync(path) && readFileSync(path, "utf8") === plist;
+    if (!unchanged)
+        atomicWrite(path, plist, 0o600);
     ensurePrivateFile(join(store.paths.logDir, "daemon.log"));
     ensurePrivateFile(join(store.paths.logDir, "daemon-error.log"));
     if (!activate || process.platform !== "darwin" || home !== homedir()) {
         return { path, active: false, detail: "LaunchAgent written; activation skipped in isolated mode", kind: "launchd" };
     }
     const domain = `gui/${process.getuid?.() ?? 0}`;
-    // Reload only CAMP's own service so an idempotent setup also applies an
-    // updated executable path or environment without touching other agents.
-    spawnSync("launchctl", ["bootout", domain, path], {
+    const loaded = spawnSync("launchctl", ["print", `${domain}/io.campmemory.daemon`], {
         encoding: "utf8",
-        stdio: "ignore",
+        stdio: ["ignore", "pipe", "pipe"],
     });
+    if (unchanged && loaded.status === 0) {
+        return {
+            path,
+            active: true,
+            detail: "LaunchAgent already loaded; unchanged CAMP setup preserved its running daemon",
+            kind: "launchd",
+        };
+    }
+    // Reload only when CAMP's own service definition changed. This applies a
+    // new executable path without churning a healthy idempotent setup.
+    if (loaded.status === 0) {
+        spawnSync("launchctl", ["bootout", domain, path], {
+            encoding: "utf8",
+            stdio: "ignore",
+        });
+    }
     const bootstrap = spawnSync("launchctl", ["bootstrap", domain, path], {
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"],
@@ -743,8 +958,34 @@ export function integrationHealth(store) {
             }
             if (entry.format === "json-hooks") {
                 const hooks = parsed.hooks;
-                return Object.entries(entry.installedEntry).every(([event, owned]) => Array.isArray(hooks?.[event]) &&
+                const rawOwned = entry.installedEntry;
+                const ownedHooks = rawOwned.__campHooks && typeof rawOwned.__campHooks === "object"
+                    ? rawOwned.__campHooks
+                    : rawOwned;
+                const hooksHealthy = Object.entries(ownedHooks).every(([event, owned]) => Array.isArray(hooks?.[event]) &&
                     hooks[event].some((candidate) => JSON.stringify(candidate) === JSON.stringify(owned)));
+                const requiredPermissions = Array.isArray(rawOwned.__campPermissionAllow)
+                    ? rawOwned.__campPermissionAllow.filter((value) => typeof value === "string")
+                    : [];
+                const permissions = parsed.permissions;
+                const allow = Array.isArray(permissions?.allow) ? permissions.allow : [];
+                return hooksHealthy && requiredPermissions.every((value) => allow.includes(value));
+            }
+            if (entry.format === "json-string-array") {
+                const owned = entry.installedEntry;
+                if (!Array.isArray(owned.fieldPath) ||
+                    !owned.fieldPath.every((value) => typeof value === "string") ||
+                    !Array.isArray(owned.values) ||
+                    !owned.values.every((value) => typeof value === "string")) {
+                    return false;
+                }
+                let current = parsed;
+                for (const field of owned.fieldPath) {
+                    if (!current || typeof current !== "object" || Array.isArray(current))
+                        return false;
+                    current = current[field];
+                }
+                return Array.isArray(current) && owned.values.every((value) => current.includes(value));
             }
             const owned = entry.installedEntry;
             return (Array.isArray(parsed[owned.field]) &&
@@ -758,8 +999,16 @@ export function integrationHealth(store) {
         if (!client.installed)
             return { client: client.name, status: "degraded", detail: "Client is not installed" };
         const entries = manifest.entries.filter((item) => item.client === client.name);
-        if (!entries.length || !entries.every(entryHealthy)) {
-            return { client: client.name, status: "degraded", detail: "CAMP MCP integration is missing" };
+        if (!entries.length) {
+            return { client: client.name, status: "degraded", detail: "CAMP integration manifest has no entries for this client" };
+        }
+        const unhealthy = entries.filter((entry) => !entryHealthy(entry));
+        if (unhealthy.length) {
+            return {
+                client: client.name,
+                status: "degraded",
+                detail: `Missing or modified CAMP integration entries: ${unhealthy.map((entry) => entry.path).join(", ")}`,
+            };
         }
         return { client: client.name, status: "ok", detail: entries.map((entry) => entry.path).join(", ") };
     });

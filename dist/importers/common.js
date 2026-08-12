@@ -1,9 +1,135 @@
-import { opendir, readFile, stat } from "node:fs/promises";
+import { opendir, open, readFile, stat } from "node:fs/promises";
+import { setTimeout as delay } from "node:timers/promises";
 import { createReadStream, existsSync, realpathSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { extname, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { SCHEMA_VERSION } from "../types.js";
 import { fileFingerprint, isInsidePath, nowIso, sha256, stableId, toStringContent } from "../utils.js";
+import { redactForRecall } from "../redaction.js";
+const TRANSIENT_READ_CODES = new Set(["EAGAIN", "EINTR", "EBUSY", "UNSTABLE_SNAPSHOT"]);
+/**
+ * Read just enough of a JSONL transcript to attribute it to a project before
+ * paying the cost of parsing and hashing the complete file. The prefix is read
+ * twice from a stable inode. Appends after the initial stat are allowed, but a
+ * replacement, truncation, changed prefix, or incomplete final record is never
+ * treated as stable evidence.
+ */
+export async function readJsonLinePrefix(path, maxBytes = 256 * 1024, maxLines = 64) {
+    let last = null;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+        let descriptor = null;
+        try {
+            const before = await stat(path);
+            if (!before.size)
+                return [];
+            const extent = Math.min(before.size, Math.max(1, maxBytes));
+            descriptor = await open(path, "r");
+            const first = Buffer.alloc(extent);
+            const firstRead = await descriptor.read(first, 0, extent, 0);
+            if (firstRead.bytesRead !== extent) {
+                throw Object.assign(new Error("JSONL prefix changed before it could be read"), {
+                    code: "UNSTABLE_SNAPSHOT",
+                });
+            }
+            const second = Buffer.alloc(extent);
+            const secondRead = await descriptor.read(second, 0, extent, 0);
+            if (secondRead.bytesRead !== extent || !first.equals(second)) {
+                throw Object.assign(new Error("JSONL prefix changed during project attribution"), {
+                    code: "UNSTABLE_SNAPSHOT",
+                });
+            }
+            const after = await stat(path);
+            if (after.dev !== before.dev || after.ino !== before.ino || after.size < before.size) {
+                throw Object.assign(new Error("JSONL file was replaced or truncated during project attribution"), {
+                    code: "UNSTABLE_SNAPSHOT",
+                });
+            }
+            const complete = extent === before.size && first[extent - 1] === 0x0a;
+            const lines = first.toString("utf8").split("\n");
+            if (!complete)
+                lines.pop();
+            const entries = [];
+            for (let index = 0; index < lines.length && entries.length < maxLines; index += 1) {
+                const text = lines[index];
+                if (!text?.trim())
+                    continue;
+                try {
+                    const value = JSON.parse(text);
+                    if (value && typeof value === "object" && !Array.isArray(value)) {
+                        entries.push({ value: value, line: index + 1 });
+                    }
+                }
+                catch (error) {
+                    throw new Error(`Malformed JSONL record at line ${index + 1}: ${error instanceof Error ? error.message : String(error)}`);
+                }
+            }
+            return entries;
+        }
+        catch (error) {
+            last = error;
+            const code = String(error.code);
+            if (!TRANSIENT_READ_CODES.has(code) || attempt === 2)
+                throw error;
+            await delay(25 * 2 ** attempt);
+        }
+        finally {
+            await descriptor?.close().catch(() => undefined);
+        }
+    }
+    throw last;
+}
+async function jsonlSnapshot(path) {
+    let last = null;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+        let descriptor = null;
+        try {
+            const snapshot = await stat(path);
+            if (!snapshot.size) {
+                return {
+                    size: 0,
+                    dev: snapshot.dev,
+                    ino: snapshot.ino,
+                    mtimeMs: snapshot.mtimeMs,
+                    terminated: true,
+                };
+            }
+            descriptor = await open(path, "r");
+            const tail = Buffer.alloc(1);
+            const read = await descriptor.read(tail, 0, 1, snapshot.size - 1);
+            if (read.bytesRead !== 1) {
+                throw Object.assign(new Error("JSONL file changed before its snapshot extent could be read"), {
+                    code: "UNSTABLE_SNAPSHOT",
+                });
+            }
+            return {
+                size: snapshot.size,
+                dev: snapshot.dev,
+                ino: snapshot.ino,
+                mtimeMs: snapshot.mtimeMs,
+                terminated: tail[0] === 0x0a,
+            };
+        }
+        catch (error) {
+            last = error;
+            if (!TRANSIENT_READ_CODES.has(String(error.code)) || attempt === 2) {
+                throw error;
+            }
+            await delay(25 * 2 ** attempt);
+        }
+        finally {
+            await descriptor?.close().catch(() => undefined);
+        }
+    }
+    throw last;
+}
+async function hashExtent(path, size) {
+    const hash = createHash("sha256");
+    const stream = createReadStream(path, { start: 0, end: size - 1 });
+    for await (const chunk of stream)
+        hash.update(chunk);
+    return hash.digest("hex");
+}
 export async function walkFiles(root, extensions, maxDepth = 8) {
     if (!existsSync(root))
         return [];
@@ -36,24 +162,98 @@ export async function walkFiles(root, extensions, maxDepth = 8) {
     await visit(root, 0);
     return result.sort();
 }
-export async function readJsonLines(path, handler) {
-    const stream = createReadStream(path, { encoding: "utf8" });
-    const reader = createInterface({ input: stream, crlfDelay: Infinity });
-    let line = 0;
-    for await (const text of reader) {
-        line += 1;
-        if (!text.trim())
-            continue;
+export async function readJsonLines(path, handler, cooperate = async () => undefined, yieldEvery = 1) {
+    const snapshot = await jsonlSnapshot(path);
+    if (!snapshot.size)
+        return;
+    let processed = 0;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+        const stream = createReadStream(path, {
+            encoding: "utf8",
+            start: 0,
+            end: snapshot.size - 1,
+        });
+        const snapshotHash = createHash("sha256");
+        stream.on("data", (chunk) => {
+            snapshotHash.update(chunk);
+        });
+        const reader = createInterface({ input: stream, crlfDelay: Infinity });
+        let line = 0;
+        let pending = null;
         try {
-            const value = JSON.parse(text);
-            if (value && typeof value === "object" && !Array.isArray(value)) {
-                handler(value, line);
+            const dispatch = async (entry) => {
+                if (entry.line <= processed || !entry.text.trim())
+                    return;
+                try {
+                    const value = JSON.parse(entry.text);
+                    if (value && typeof value === "object" && !Array.isArray(value)) {
+                        await handler(value, entry.line);
+                    }
+                }
+                catch (error) {
+                    throw new Error(`Malformed JSONL record at line ${entry.line}: ${error instanceof Error ? error.message : String(error)}`);
+                }
+                processed = entry.line;
+                // Native transcripts can contain many megabytes of tool output. Yield
+                // at deterministic record boundaries so an active source import never
+                // monopolizes the daemon's single writer or its health socket.
+                if (processed % Math.max(1, yieldEvery) === 0)
+                    await cooperate();
+            };
+            for await (const text of reader) {
+                line += 1;
+                if (pending)
+                    await dispatch(pending);
+                pending = { text, line };
             }
+            if (pending && snapshot.terminated)
+                await dispatch(pending);
+            let after;
+            try {
+                after = await stat(path);
+            }
+            catch (error) {
+                throw Object.assign(new Error("JSONL file disappeared during its bounded snapshot read"), {
+                    code: "UNSTABLE_SNAPSHOT",
+                    cause: error,
+                });
+            }
+            const replaced = after.dev !== snapshot.dev || after.ino !== snapshot.ino;
+            const truncated = after.size < snapshot.size;
+            const rewrittenAtSameExtent = after.size === snapshot.size && after.mtimeMs !== snapshot.mtimeMs;
+            if (replaced || truncated || rewrittenAtSameExtent) {
+                throw Object.assign(new Error("JSONL file changed inside the initial snapshot extent; checkpoint was not advanced"), { code: "UNSTABLE_SNAPSHOT" });
+            }
+            const stableHash = await hashExtent(path, snapshot.size);
+            if (snapshotHash.digest("hex") !== stableHash) {
+                throw Object.assign(new Error("JSONL file changed while CAMP verified the initial snapshot extent; checkpoint was not advanced"), { code: "UNSTABLE_SNAPSHOT" });
+            }
+            return;
         }
-        catch {
-            // A partially written final line is retried during the next sync.
+        catch (error) {
+            const code = error.code;
+            if (!TRANSIENT_READ_CODES.has(String(code)) || attempt === 2)
+                throw error;
+            await delay(25 * 2 ** attempt);
+        }
+        finally {
+            reader.close();
+            stream.destroy();
         }
     }
+}
+export function importErrorDetail(source, phase, error, path = null) {
+    const system = error && typeof error === "object" ? error : null;
+    return {
+        source,
+        phase,
+        path: path ? redactForRecall(path).slice(0, 4_096) : null,
+        message: redactForRecall(error instanceof Error ? error.message : String(error)).slice(0, 4_096),
+        code: typeof system?.code === "string" ? system.code : null,
+        errno: typeof system?.errno === "number" ? system.errno : null,
+        syscall: typeof system?.syscall === "string" ? system.syscall : null,
+        observedAt: nowIso(),
+    };
 }
 export function projectMatch(cwd, project) {
     if (!cwd)

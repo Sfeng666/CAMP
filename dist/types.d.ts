@@ -1,4 +1,4 @@
-export declare const SCHEMA_VERSION: 1;
+export declare const SCHEMA_VERSION: 2;
 export type ProjectKind = "git" | "workspace";
 export type AgentSource = "codex" | "claude" | "cursor" | "antigravity" | "archive" | "unknown";
 /** Where the native agent session was captured. */
@@ -119,6 +119,95 @@ export interface ImportSummary {
     skipped: number;
     quarantined: number;
     errors: string[];
+    errorDetails?: ImportErrorDetail[];
+}
+export interface ImportErrorDetail {
+    source: AgentSource;
+    phase: string;
+    path: string | null;
+    message: string;
+    code: string | null;
+    errno: number | null;
+    syscall: string | null;
+    observedAt: string;
+}
+export type FreshnessStatus = "ok" | "degraded" | "never";
+export interface SourceFreshness {
+    source: AgentSource;
+    enabled: boolean;
+    status: FreshnessStatus;
+    lastAttemptAt: string | null;
+    lastSuccessfulScanAt: string | null;
+    lagSeconds: number | null;
+    scanned: number;
+    imported: number;
+    replaced: number;
+    skipped: number;
+    quarantined: number;
+    error: ImportErrorDetail | null;
+}
+export type ContextVerdict = "pending_ack" | "PASS" | "WARN" | "FAIL";
+export interface ContextReceipt {
+    schemaVersion: 1;
+    id: string;
+    projectId: string;
+    projectRoot: string;
+    taskHash: string;
+    currentCommit: string | null;
+    worktreeFingerprint: string | null;
+    handoff: {
+        id: string;
+        hash: string;
+        updatedAt: string;
+        state: EvidenceState;
+    } | null;
+    evidenceIds: string[];
+    contextHash: string;
+    freshness: SourceFreshness[];
+    quarantineCount: number;
+    degradedComponents: string[];
+    issuedAt: string;
+    expiresAt: string;
+    challenge: string;
+    client: {
+        name: string;
+        version: string;
+        instanceId: string;
+    };
+    deliveryMode: "mcp" | "hook" | "cli";
+    verificationRunId: string | null;
+    verdict: ContextVerdict;
+    reasons: string[];
+    signature: string;
+}
+export interface ContextAcknowledgment {
+    schemaVersion: 1;
+    id: string;
+    receiptId: string;
+    projectId: string;
+    client: ContextReceipt["client"];
+    evidenceIds: string[];
+    recalledFact: string;
+    acknowledgedAt: string;
+    verdict: Exclude<ContextVerdict, "pending_ack">;
+    reasons: string[];
+}
+export interface VerificationRun {
+    schemaVersion: 1;
+    id: string;
+    projectId: string;
+    sourceAgent: AgentSource;
+    sourceSurface: AgentSurface;
+    sourceClient: ContextReceipt["client"];
+    targetAgents: AgentSource[];
+    canary: string;
+    canaryHash: string;
+    evidenceId: string;
+    rawSessionId: string | null;
+    status: "awaiting_source" | "awaiting_import" | "ready" | "passed" | "failed" | "cancelled" | "expired";
+    createdAt: string;
+    expiresAt: string;
+    cancelledAt: string | null;
 }
 export interface DoctorCheck {
     name: string;

@@ -3,6 +3,7 @@ import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { isolatedCamp, type IsolatedCamp } from "./helpers.js";
+import { rpcCall, waitForDaemonExit } from "../src/rpc.js";
 
 const SOURCE = resolve("src", "cli.ts");
 
@@ -13,7 +14,11 @@ describe("one-command project bootstrap", () => {
     env = isolatedCamp();
   });
 
-  afterEach(() => env.cleanup());
+  afterEach(async () => {
+    await rpcCall("shutdown").catch(() => undefined);
+    await waitForDaemonExit().catch(() => undefined);
+    env.cleanup();
+  });
 
   function run(args: string[]) {
     return spawnSync(process.execPath, ["--import", "tsx", SOURCE, ...args], {
@@ -27,6 +32,7 @@ describe("one-command project bootstrap", () => {
         CLAUDE_PROJECTS_DIR: join(env.root, "no-claude"),
         CURSOR_DATA_DIR: join(env.root, "no-cursor"),
         ANTIGRAVITY_DATA_DIR: join(env.root, "no-antigravity"),
+        CAMP_DAEMON_IDLE_MS: "30000",
       },
       timeout: 30_000,
     });

@@ -94,3 +94,33 @@ export function truncateByApproxTokens(text: string, maxTokens: number): string 
   if (text.length <= maxChars) return text;
   return `${text.slice(0, Math.max(0, maxChars - 24)).trimEnd()}\n[truncated by CAMP]`;
 }
+
+/**
+ * Await slow local inference or a child backend without monopolizing the
+ * daemon's mutation FIFO. The operation keeps running, but authenticated work
+ * that was already queued can complete at each bounded pulse.
+ */
+export async function cooperativeAwait<T>(
+  operation: Promise<T>,
+  cooperate: () => Promise<void>,
+  intervalMs = 250,
+): Promise<T> {
+  type Outcome = { ok: true; value: T } | { ok: false; error: unknown };
+  const settled = operation.then<Outcome, Outcome>(
+    (value) => ({ ok: true as const, value }),
+    (error: unknown) => ({ ok: false as const, error }),
+  );
+  while (true) {
+    let timer: NodeJS.Timeout | null = null;
+    const pulse = new Promise<null>((resolvePulse) => {
+      timer = setTimeout(() => resolvePulse(null), Math.max(25, intervalMs));
+    });
+    const outcome = await Promise.race([settled, pulse]);
+    if (outcome) {
+      if (timer) clearTimeout(timer);
+      if (outcome.ok) return outcome.value;
+      throw outcome.error;
+    }
+    await cooperate();
+  }
+}

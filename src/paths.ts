@@ -17,6 +17,10 @@ export interface CampPaths {
   registryExport: string;
   machineConfig: string;
   modelManifest: string;
+  rpcToken: string;
+  receiptKey: string;
+  daemonLock: string;
+  migrationLock: string;
 }
 
 export function getCampPaths(): CampPaths {
@@ -70,6 +74,10 @@ export function getCampPaths(): CampPaths {
     registryExport: join(home, "projects.json"),
     machineConfig: join(configDir, "config.json"),
     modelManifest: join(configDir, "models.json"),
+    rpcToken: join(home, "runtime", "rpc-token"),
+    receiptKey: join(home, "runtime", "receipt-key"),
+    daemonLock: join(home, "runtime", "daemon.lock"),
+    migrationLock: join(home, "runtime", "migration.lock"),
   };
 }
 

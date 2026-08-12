@@ -52,6 +52,10 @@ export function getCampPaths() {
         registryExport: join(home, "projects.json"),
         machineConfig: join(configDir, "config.json"),
         modelManifest: join(configDir, "models.json"),
+        rpcToken: join(home, "runtime", "rpc-token"),
+        receiptKey: join(home, "runtime", "receipt-key"),
+        daemonLock: join(home, "runtime", "daemon.lock"),
+        migrationLock: join(home, "runtime", "migration.lock"),
     };
 }
 export function ensurePrivateDirectory(path) {

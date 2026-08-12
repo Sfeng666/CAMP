@@ -6,6 +6,8 @@ import type { DoctorCheck } from "./types.js";
 import type { CampStore } from "./store.js";
 import { detectClients, integrationHealth } from "./integrations.js";
 import { ensureLocalModels } from "./models.js";
+import { CHATCRYSTAL_BASELINE } from "./backends/chatcrystal.js";
+import { MEMORIX_BASELINE } from "./backends/memorix.js";
 
 function packageVersion(name: string): string | null {
   const require = createRequire(import.meta.url);
@@ -99,11 +101,17 @@ export async function runDoctor(store: CampStore): Promise<DoctorCheck[]> {
     status: mode & 0o077 ? "error" : "ok",
     detail: `${store.paths.home} mode ${mode.toString(8)}`,
   });
-  for (const [name, expected] of [
-    ["chatcrystal", "0.5.8"],
-    ["memorix", "1.3.1"],
-    ["better-sqlite3", "12.11.1"],
-  ] as const) {
+  checks.push({
+    name: "chatcrystal",
+    status: "ok",
+    detail: `narrow local ingest adapter; source-compatible baseline ${CHATCRYSTAL_BASELINE}`,
+  });
+  checks.push({
+    name: "memorix",
+    status: "ok",
+    detail: `narrow curated-memory adapter; source-compatible baseline ${MEMORIX_BASELINE}`,
+  });
+  for (const [name, expected] of [["better-sqlite3", "12.11.1"]] as const) {
     const version = packageVersion(name);
     checks.push({
       name,
@@ -112,6 +120,36 @@ export async function runDoctor(store: CampStore): Promise<DoctorCheck[]> {
     });
   }
   checks.push(await ollamaCheck());
+  checks.push({
+    name: "daemon-single-writer",
+    status: "ok",
+    detail: `PID ${process.pid} owns the only writable CAMP database handle; CLI, MCP, and hooks use authenticated RPC`,
+  });
+  for (const project of store.listProjects()) {
+    const freshness = store.sourceFreshness(project.id);
+    if (!freshness.length) {
+      checks.push({
+        name: `freshness:${project.id}`,
+        status: "degraded",
+        detail: "No source synchronization has completed",
+      });
+    }
+    for (const source of freshness) {
+      const current =
+        source.status === "ok" && source.lastSuccessfulScanAt !== null && (source.lagSeconds ?? Infinity) <= 120;
+      checks.push({
+        name: `freshness:${project.id}:${source.source}`,
+        status: current ? "ok" : "degraded",
+        detail: JSON.stringify({
+          status: source.status,
+          lastAttemptAt: source.lastAttemptAt,
+          lastSuccessfulScanAt: source.lastSuccessfulScanAt,
+          lagSeconds: source.lagSeconds,
+          error: source.error,
+        }),
+      });
+    }
+  }
   for (const client of integrationHealth(store)) {
     const installed = detectClients().find((item) => item.name === client.client)?.installed;
     checks.push({

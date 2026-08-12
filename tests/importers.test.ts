@@ -97,13 +97,36 @@ describe("streaming native history adapters", () => {
     ]);
 
     const result = await importCodex(store, project, join(env.root, "empty-sessions"));
+    const repeated = await importCodex(store, project, join(env.root, "empty-sessions"));
     expect(result.imported).toBe(1);
+    expect(repeated.skipped).toBe(1);
     const hit = store.search(project.id, "humane outreach", "raw")[0];
     expect(hit?.source).toBe("archive");
     const session = store.getSession(store.listSessionIds(project.id)[0] ?? "", project.id);
     expect(session?.messages[0]?.metadata?.sourceFile).toBe(
       "/sanitized/codex/session.jsonl",
     );
+  });
+
+  it("checkpoints negative project attribution instead of reparsing unrelated JSONL", async () => {
+    const root = join(env.root, "project");
+    const unrelated = join(env.root, "other-project");
+    mkdirSync(root);
+    mkdirSync(unrelated);
+    const project = setupProject(store, root);
+    const sessions = join(env.root, "codex-sessions");
+    jsonl(join(sessions, "unrelated.jsonl"), [
+      { type: "session_meta", payload: { id: "other", cwd: unrelated } },
+      {
+        type: "response_item",
+        payload: { type: "message", role: "user", content: "Large unrelated history" },
+      },
+    ]);
+
+    const first = await importCodex(store, project, sessions);
+    const second = await importCodex(store, project, sessions);
+    expect(first.imported).toBe(0);
+    expect(second.skipped).toBe(1);
   });
 
   it("quarantines a parent-workspace Claude session until it is explicitly assigned", async () => {
@@ -134,10 +157,12 @@ describe("streaming native history adapters", () => {
     const first = await importClaude(store, project, sessions);
     expect(first.quarantined).toBe(1);
     expect(first.imported).toBe(0);
+    const unchanged = await importClaude(store, project, sessions);
+    expect(unchanged.skipped).toBe(1);
     const item = store.listQuarantine(project.id)[0];
     expect(store.resolveQuarantine(String(item?.id), project.id)).toBe(true);
-    const second = await importClaude(store, project, sessions);
-    expect(second.imported).toBe(1);
+    const assigned = await importClaude(store, project, sessions);
+    expect(assigned.imported).toBe(1);
   });
 
   it("captures Antigravity hook transcripts and quarantines unknown local schemas", async () => {

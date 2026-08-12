@@ -1,5 +1,12 @@
 import type { EvidenceRecord, ProjectRegistration } from "../types.js";
 import type { CampStore } from "../store.js";
+/**
+ * CAMP mirrors curated Git-project evidence into the stable observation
+ * contract used by Memorix 1.3.1. The upstream package remains a pinned
+ * compatibility-test baseline, but its CLI, model runtimes, dashboard, and
+ * optional native/image dependencies are not installed in production.
+ */
+export declare const MEMORIX_BASELINE = "1.3.1";
 interface MemorixObservationRow {
     id: number;
     title: string;
@@ -20,18 +27,14 @@ export declare function prepareMemorixMigration(store: CampStore, project: Proje
     manifestHash: string | null;
 };
 export declare function finalizeMemorixMigration(store: CampStore, project: ProjectRegistration): boolean;
-export declare function flushMemorix(store: CampStore, project: ProjectRegistration): {
+export interface MemorixFlushResult {
     completed: number;
     failed: number;
+    pending: number;
     unavailable: boolean;
     errors: string[];
-};
-/**
- * Remove every successfully mirrored CAMP record for one exact project before
- * canonical purge. The public Memorix lifecycle archives each exact match
- * first; CAMP then deletes only those verified backend rows and records a
- * restart-safe receipt before canonical data is removed.
- */
+}
+export declare function flushMemorix(store: CampStore, project: ProjectRegistration, cooperate?: () => Promise<void>, limit?: number): Promise<MemorixFlushResult>;
 export declare function archiveMemorixProjectRecords(store: CampStore, project: ProjectRegistration): {
     deleted: number;
     alreadyDeleted: number;
