@@ -17,6 +17,7 @@ function commandPath(command) {
 }
 export function detectClients() {
     const home = userHome();
+    const cursorCliConfig = join(home, ".cursor", "cli-config.json");
     const detections = [
         {
             name: "codex",
@@ -29,7 +30,10 @@ export function detectClients() {
             installed: Boolean(commandPath("cursor") || commandPath("cursor-agent") || existsSync(join(home, ".cursor"))),
             detail: commandPath("cursor-agent") ?? commandPath("cursor") ?? join(home, ".cursor"),
             surfaces: [
-                ...(commandPath("cursor-agent") ? ["cli"] : []),
+                // A persisted Cursor CLI policy is evidence that this user has used
+                // the CLI, even when its executable is not on the current PATH. This
+                // matters for a new login shell and for `camp init` on CI hosts.
+                ...(commandPath("cursor-agent") || existsSync(cursorCliConfig) ? ["cli"] : []),
                 ...(commandPath("cursor") || existsSync(join(home, ".cursor")) ? ["ide"] : []),
             ],
         },

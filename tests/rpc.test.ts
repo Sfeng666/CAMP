@@ -83,8 +83,12 @@ describe("daemon single-writer RPC", () => {
     const status = run(["status", root, "--json"]);
     expect(status.status, status.stderr).toBe(0);
     expect(JSON.parse(status.stdout)).toMatchObject({ evidence: 5 });
-    const daemonErrors = join(env.user, "Library", "Logs", "CAMP", "daemon-error.log");
-    expect(readFileSync(daemonErrors, "utf8")).not.toMatch(/readonly database|database is locked/i);
+    // A session daemon has no launchd/systemd stderr sink, so an absent log is
+    // a valid clean state. When a service log exists, assert that it contains
+    // no SQLite writer contention on every supported host.
+    const daemonErrors = join(getCampPaths().logDir, "daemon-error.log");
+    const errors = existsSync(daemonErrors) ? readFileSync(daemonErrors, "utf8") : "";
+    expect(errors).not.toMatch(/readonly database|database is locked/i);
   }, 30_000);
 
   it("gives an already-waiting receipt its FIFO turn during a cooperative background scan", async () => {
